@@ -1,0 +1,9 @@
+{
+  "name": "ai-meeting-assistant",
+  "version": "1.0.0",
+  "description": "Chrome extension AI assistant for remote video meetings",
+  "private": true,
+  "scripts": {
+    "icons": "node scripts/generate-icons.js"
+  }
+}

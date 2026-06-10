@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Meeting Assistant</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="popup-container">
+    <header class="popup-header">
+      <span class="logo">🤖</span>
+      <h1>AI Meeting Assistant</h1>
+    </header>
+
+    <nav class="tabs">
+      <button class="tab active" data-tab="documents">Documents</button>
+      <button class="tab" data-tab="settings">API Settings</button>
+    </nav>
+
+    <section id="tab-documents" class="tab-panel active">
+      <div class="readiness" id="readiness-panel">
+        <div class="readiness-item" id="readiness-api">API: checking...</div>
+        <div class="readiness-item" id="readiness-docs">Documents: checking...</div>
+      </div>
+      <p class="hint">Upload reference materials before your meeting.</p>
+
+      <div class="doc-types">
+        <label class="doc-type-btn">
+          <input type="file" accept=".txt,.pdf,.doc,.docx,.md" data-type="work-history" hidden />
+          📚 Work History
+        </label>
+        <label class="doc-type-btn">
+          <input type="file" accept=".txt,.pdf,.doc,.docx,.md" data-type="resume" hidden />
+          📄 Resume
+        </label>
+        <label class="doc-type-btn">
+          <input type="file" accept=".txt,.pdf,.doc,.docx,.md" data-type="skill-sheet" hidden />
+          🛠 Skill Sheet
+        </label>
+        <label class="doc-type-btn">
+          <input type="file" accept=".txt,.pdf,.doc,.docx,.md" data-type="company-info" hidden />
+          🏢 Company Info
+        </label>
+        <label class="doc-type-btn">
+          <input type="file" accept=".txt,.pdf,.doc,.docx,.md" data-type="job-description" hidden />
+          📋 Job Description
+        </label>
+        <label class="doc-type-btn">
+          <input type="file" accept=".txt,.pdf,.doc,.docx,.md" data-type="bid-document" hidden />
+          📑 Bid Document
+        </label>
+        <label class="doc-type-btn">
+          <input type="file" accept="image/png,image/jpeg,image/webp,image/gif" data-type="project-image" multiple hidden />
+          🖼 Project Images
+        </label>
+      </div>
+
+      <div class="manual-input">
+        <label>Or paste text directly:</label>
+        <select id="manual-doc-type">
+          <option value="work-history">Work History</option>
+          <option value="resume">Resume</option>
+          <option value="skill-sheet">Skill Sheet</option>
+          <option value="company-info">Company Info</option>
+          <option value="job-description">Job Description</option>
+          <option value="bid-document">Bid Document</option>
+          <option value="project-image">Project Image</option>
+        </select>
+        <textarea id="manual-doc-text" placeholder="Paste document content here..."></textarea>
+        <div id="image-paste-zone" class="image-paste-zone" hidden>
+          Paste or drop project images here (mockups, wireframes, screenshots)
+        </div>
+        <button id="save-manual-doc" class="btn-primary">Save Document</button>
+      </div>
+
+      <div class="image-analysis-panel" id="image-analysis-panel" hidden>
+        <div class="image-analysis-header">
+          <span>🖼 Project Image Analysis</span>
+          <button id="reanalyze-images" class="btn-link" type="button">Re-analyze</button>
+        </div>
+        <p class="image-analysis-text" id="image-analysis-text"></p>
+      </div>
+
+      <div class="doc-list" id="doc-list">
+        <p class="empty">No documents uploaded yet.</p>
+      </div>
+    </section>
+
+    <section id="tab-settings" class="tab-panel">
+      <div class="form-group">
+        <label>AI Provider</label>
+        <select id="api-provider">
+          <option value="openai">OpenAI (GPT-4o)</option>
+          <option value="claude">Claude (Sonnet)</option>
+        </select>
+      </div>
+
+      <div class="form-group" id="openai-key-group">
+        <label>OpenAI API Key</label>
+        <input type="password" id="openai-key" placeholder="sk-..." />
+      </div>
+
+      <div class="form-group" id="claude-key-group" style="display:none">
+        <label>Claude API Key</label>
+        <input type="password" id="claude-key" placeholder="sk-ant-..." />
+      </div>
+
+      <div class="form-group">
+        <label>Display Language</label>
+        <select id="popup-display-lang">
+          <option value="en">English</option>
+          <option value="ja">Japanese</option>
+          <option value="es">Spanish</option>
+          <option value="pt">Portuguese</option>
+          <option value="zh">Chinese</option>
+        </select>
+      </div>
+
+      <div class="form-group">
+        <label>Your Output Language</label>
+        <select id="popup-self-lang">
+          <option value="en">English</option>
+          <option value="ja">Japanese</option>
+          <option value="es">Spanish</option>
+          <option value="pt">Portuguese</option>
+          <option value="zh">Chinese</option>
+        </select>
+        <p class="field-hint">How your own speech appears to you in the transcript.</p>
+      </div>
+
+      <div class="form-group">
+        <label>Language for Client (Your Speech → Client Hears)</label>
+        <select id="popup-client-comm-lang">
+          <option value="en">English</option>
+          <option value="ja">Japanese</option>
+          <option value="es">Spanish</option>
+          <option value="pt">Portuguese</option>
+          <option value="zh">Chinese</option>
+        </select>
+        <p class="field-hint">Whatever language you speak, AI converts it to this language for the client via OpenAI/Claude.</p>
+      </div>
+
+      <div class="form-group">
+        <label>Client Speaks (speech recognition)</label>
+        <select id="popup-client-input-lang">
+          <option value="auto">Auto-detect</option>
+          <option value="en">English</option>
+          <option value="ja">Japanese</option>
+          <option value="es">Spanish</option>
+          <option value="pt">Portuguese</option>
+          <option value="zh">Chinese</option>
+        </select>
+      </div>
+
+      <div class="form-group">
+        <label>You Speak (speech recognition)</label>
+        <select id="popup-self-input-lang">
+          <option value="auto">Auto-detect</option>
+          <option value="en">English</option>
+          <option value="ja">Japanese</option>
+          <option value="es">Spanish</option>
+          <option value="pt">Portuguese</option>
+          <option value="zh">Chinese</option>
+        </select>
+      </div>
+
+      <button id="save-settings" class="btn-primary">Save Settings</button>
+      <p class="status" id="settings-status"></p>
+    </section>
+
+    <footer class="popup-footer">
+      <button id="open-meet" class="btn-secondary">Google Meet</button>
+      <button id="open-zoom" class="btn-secondary">Zoom</button>
+      <button id="export-session" class="btn-secondary">Export</button>
+      <button id="clear-session" class="btn-danger">Clear</button>
+    </footer>
+  </div>
+
+  <script src="popup.js" type="module"></script>
+</body>
+</html>
