@@ -18,9 +18,13 @@ export const DEFAULT_PARTICIPANTS = [
 ];
 
 export const DEFAULT_SETTINGS = {
-  apiProvider: 'openai',
+  apiProvider: 'gemini',
   openaiApiKey: '',
   claudeApiKey: '',
+  geminiApiKey: '',
+  geminiModel: 'gemini-flash-latest',
+  openaiTextAiEnabled: true,
+  claudeTextAiEnabled: true,
   displayLanguage: 'en',
   selfOutputLanguage: 'en',
   clientInputLanguage: 'auto',
@@ -33,13 +37,13 @@ export const DEFAULT_SETTINGS = {
   participants: DEFAULT_PARTICIPANTS,
   currentParticipantId: 'client-1',
   usePastMeetingInsights: true,
-  elevenLabsApiKey: '',
-  elevenLabsVoiceId: '',
-  voiceCloneName: 'My Meeting Voice',
-  voiceSamples: [],
-  voiceStability: 0.38,
-  voiceSimilarity: 0.88,
-  voiceStyle: 0.42,
+  openaiTtsVoice: 'onyx',
+  openaiTtsModel: 'tts-1-hd',
+  openaiTtsSpeed: 0.95,
+  naturalSpeechEnabled: true,
+  lockVoiceToProfile: false,
+  voiceProfile: null,
+  voiceSampleDataUrl: '',
   autoSpeakResponses: false,
   muteMicDuringSpeak: true,
   stealthMode: true,
@@ -87,13 +91,17 @@ export const MESSAGE_TYPES = {
   DELETE_MEETING_ARCHIVE: 'DELETE_MEETING_ARCHIVE',
   UPDATE_LIVE_PROFILES: 'UPDATE_LIVE_PROFILES',
   GET_LIVE_PROFILES: 'GET_LIVE_PROFILES',
-  SAVE_VOICE_SAMPLE: 'SAVE_VOICE_SAMPLE',
-  DELETE_VOICE_SAMPLE: 'DELETE_VOICE_SAMPLE',
-  CREATE_VOICE_CLONE: 'CREATE_VOICE_CLONE',
+  SAVE_VOICE_SETTINGS: 'SAVE_VOICE_SETTINGS',
   SYNTHESIZE_VOICE: 'SYNTHESIZE_VOICE',
   GET_VOICE_STATUS: 'GET_VOICE_STATUS',
-  CLEAR_VOICE_CLONE: 'CLEAR_VOICE_CLONE',
-  GET_PERMANENT_DOCUMENTS: 'GET_PERMANENT_DOCUMENTS'
+  RESET_VOICE_SETTINGS: 'RESET_VOICE_SETTINGS',
+  ANALYZE_VOICE_SAMPLE: 'ANALYZE_VOICE_SAMPLE',
+  GET_PERMANENT_DOCUMENTS: 'GET_PERMANENT_DOCUMENTS',
+  PRELOAD_REFERENCE_DOCUMENTS: 'PRELOAD_REFERENCE_DOCUMENTS',
+  TRANSCRIBE_AUDIO: 'TRANSCRIBE_AUDIO',
+  PING: 'PING',
+  MEETING_KEEPALIVE_START: 'MEETING_KEEPALIVE_START',
+  MEETING_KEEPALIVE_STOP: 'MEETING_KEEPALIVE_STOP'
 };
 
 export const SPEECH_LANG_MAP = {
@@ -103,4 +111,28 @@ export const SPEECH_LANG_MAP = {
   es: 'es-ES',
   pt: 'pt-BR',
   zh: 'zh-CN'
+};
+
+export const OPENAI_TTS_VOICES = [
+  { id: 'alloy', label: 'Alloy — neutral, balanced' },
+  { id: 'ash', label: 'Ash — warm, conversational' },
+  { id: 'coral', label: 'Coral — clear, friendly' },
+  { id: 'echo', label: 'Echo — calm, steady' },
+  { id: 'fable', label: 'Fable — expressive' },
+  { id: 'nova', label: 'Nova — natural (recommended)' },
+  { id: 'onyx', label: 'Onyx — deep, authoritative' },
+  { id: 'sage', label: 'Sage — measured, professional' },
+  { id: 'shimmer', label: 'Shimmer — bright, energetic' }
+];
+
+export const CLAUDE_MODEL = 'claude-sonnet-4-6';
+
+export const GEMINI_MODEL = 'gemini-flash-latest';
+
+export const OPENAI_TTS_LANG_VOICES = {
+  en: 'onyx',
+  ja: 'onyx',
+  es: 'echo',
+  pt: 'echo',
+  zh: 'echo'
 };

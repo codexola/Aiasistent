@@ -23,6 +23,9 @@
 
   const LANG_LABELS = Object.fromEntries(LANGUAGES.map((l) => [l.code, l.label]));
   const SIDEBAR_WIDTH = 380;
+  const SPEECH_PAUSE_MS = 3000;
+  const SPEECH_PAUSE_QUESTION_MS = 2000;
+  const RESPONSE_DELAY_MS = 1000;
 
   let settings = {};
   let participants = [];
@@ -36,15 +39,201 @@
   let conversation = [];
   let bidDocument = { tasks: [], modifications: [] };
   let responseDebounceTimer = null;
+  let responseInFlight = false;
   let lastSuggestedResponse = '';
   let currentSpeakAudio = null;
   let isSpeaking = false;
   let audioBridgeReady = false;
+  let lastCaptionKey = '';
+  let lastCaptionAt = 0;
+  let lastWhisperText = '';
+  let tabAudioRecorder = null;
+  let tabAudioStream = null;
+  let tabAudioLoopActive = false;
+  let captionObserver = null;
+  let selfDisplayName = '';
+  let extensionInvalidated = false;
+  let healthCheckTimer = null;
+  let captionMissCount = 0;
+  let responsePanelVisible = false;
+  let vttCaptionObserver = null;
+  let captionPollTimer = null;
+  let vttScanScheduled = false;
+  let clientSpeechBuffer = '';
+  let clientSpeechFlushTimer = null;
+  let lastBufferSource = 'captions';
+  let captionAutoEnableTimer = null;
+  let meetCaptionsActive = false;
+  let keepAliveTimer = null;
+  let transcriptQueue = [];
+  let flushQueueTimer = null;
 
-  async function sendMessage(type, payload) {
-    const response = await chrome.runtime.sendMessage({ type, payload });
-    if (response?.error) throw new Error(response.error);
-    return response;
+  const RETRY_DELAYS_MS = [0, 300, 700, 1500, 2500];
+
+  function isPermanentInvalidation(err) {
+    if (!chrome.runtime?.id) return true;
+    const msg = String(err?.message || err || '').toLowerCase();
+    return msg.includes('extension context invalidated');
+  }
+
+  function isTransientConnectionError(err) {
+    const msg = String(err?.message || err || '').toLowerCase();
+    return (
+      msg.includes('receiving end does not exist') ||
+      msg.includes('could not establish connection') ||
+      msg.includes('message port closed') ||
+      msg.includes('message channel closed') ||
+      msg.includes('asynchronous response') ||
+      msg.includes('no response from extension background')
+    );
+  }
+
+  function isExtensionInvalidated(err) {
+    return isPermanentInvalidation(err) || isTransientConnectionError(err);
+  }
+
+  function showExtensionReloadBanner(reason) {
+    extensionInvalidated = true;
+    let banner = document.getElementById('ai-reload-banner');
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.id = 'ai-reload-banner';
+      banner.className = 'ai-warning-banner';
+      banner.style.cssText =
+        'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;max-width:520px;text-align:center;cursor:pointer;';
+      banner.title = 'Click to refresh';
+      document.body.appendChild(banner);
+      banner.addEventListener('click', () => location.reload());
+    }
+    banner.hidden = false;
+    banner.textContent =
+      reason ||
+      'Extension was updated — click here or press F5 to refresh this meeting page';
+  }
+
+  async function wakeServiceWorker() {
+    if (!chrome.runtime?.id) return false;
+    try {
+      await chrome.runtime.sendMessage({ type: 'PING' });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function sendMessage(type, payload, options = {}) {
+    const maxAttempts = options.retries ?? 4;
+
+    if (!chrome.runtime?.id) {
+      extensionInvalidated = true;
+      showExtensionReloadBanner();
+      throw new Error('Extension updated — refresh this page (F5)');
+    }
+
+    let lastError = null;
+    for (let attempt = 0; attempt <= maxAttempts; attempt++) {
+      if (attempt > 0) {
+        await wakeServiceWorker();
+        await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt] || 2500));
+      }
+
+      try {
+        const response = await chrome.runtime.sendMessage({ type, payload });
+        if (chrome.runtime.lastError) {
+          throw new Error(chrome.runtime.lastError.message);
+        }
+        if (response === undefined || response === null) {
+          if (attempt < maxAttempts) continue;
+          throw new Error('No response from extension background');
+        }
+        if (response?.error) throw new Error(response.error);
+
+        extensionInvalidated = false;
+        const banner = document.getElementById('ai-reload-banner');
+        if (banner) banner.hidden = true;
+        if (transcriptQueue.length) scheduleTranscriptQueueFlush();
+        return response;
+      } catch (err) {
+        lastError = err;
+        if (isPermanentInvalidation(err)) {
+          extensionInvalidated = true;
+          showExtensionReloadBanner();
+          throw new Error('Extension updated — refresh this page (F5)');
+        }
+        if (!isTransientConnectionError(err) || attempt >= maxAttempts) {
+          throw err;
+        }
+      }
+    }
+
+    throw lastError || new Error('Extension connection failed');
+  }
+
+  function startMeetingKeepAlive() {
+    if (keepAliveTimer) clearInterval(keepAliveTimer);
+    sendMessage('MEETING_KEEPALIVE_START', null, { retries: 2 }).catch(() => {});
+    keepAliveTimer = setInterval(() => {
+      sendMessage('PING', null, { retries: 1 }).catch(() => {});
+    }, 20000);
+  }
+
+  function stopMeetingKeepAlive() {
+    if (keepAliveTimer) {
+      clearInterval(keepAliveTimer);
+      keepAliveTimer = null;
+    }
+    sendMessage('MEETING_KEEPALIVE_STOP', null, { retries: 1 }).catch(() => {});
+  }
+
+  function scheduleTranscriptQueueFlush() {
+    if (flushQueueTimer) return;
+    flushQueueTimer = setTimeout(async () => {
+      flushQueueTimer = null;
+      await flushTranscriptQueue();
+    }, 1500);
+  }
+
+  async function flushTranscriptQueue() {
+    if (!transcriptQueue.length) return;
+
+    while (transcriptQueue.length) {
+      const item = transcriptQueue[0];
+      try {
+        const result = await sendMessage('TRANSCRIPT_UPDATE', item.entry, { retries: 3 });
+        if (result?.entry) {
+          const idx = conversation.findIndex((e) => e.id === item.localId);
+          if (idx >= 0) {
+            conversation[idx] = result.entry;
+            refreshTranscriptEntry(item.localId, result.entry);
+          }
+          transcriptQueue.shift();
+          setStatus('Listening...', true);
+
+          if (item.scheduleResponse) {
+            try {
+              applyTranscriptSideEffects(
+                result.entry,
+                result.entry.participantRole || 'client',
+                item.entry.originalText
+              );
+            } catch (sideErr) {
+              console.warn('Transcript side effect:', sideErr);
+            }
+          }
+        } else {
+          break;
+        }
+      } catch (err) {
+        if (isPermanentInvalidation(err)) break;
+        scheduleTranscriptQueueFlush();
+        break;
+      }
+    }
+  }
+
+  function queueTranscriptUpdate(entry, localId, scheduleResponse) {
+    transcriptQueue.push({ entry, localId, scheduleResponse });
+    scheduleTranscriptQueueFlush();
   }
 
   function langOptions(list) {
@@ -70,100 +259,120 @@
         </div>
 
         <div class="ai-sidebar-body">
+          <div class="ai-sidebar-settings">
+          <div class="ai-warning-banner" id="ai-reload-banner" hidden>
+            Extension updated — refresh this page (F5) to reconnect.
+          </div>
+
           <div class="ai-warning-banner ai-stealth-hide" id="ai-voice-warning" hidden>
-            Voice not configured — open extension popup → My Voice tab.
+            Speech unavailable — add OpenAI API key in extension popup → API Settings → Speech tab.
           </div>
 
           <div class="ai-warning-banner ai-stealth-hide" id="ai-api-warning" hidden>
-            API key not set — open extension popup → API Settings.
+            AI not configured — add Claude or OpenAI key in extension popup → API Settings.
           </div>
 
-          <div class="ai-section">
-            <div class="ai-section-title">Language Settings</div>
-            <div class="ai-lang-grid">
-              <div class="ai-lang-select">
-                <label>Display Language (Client)</label>
+          <div class="ai-warning-banner ai-stealth-hide" id="ai-caption-hint" hidden>
+            Auto live caption is starting — no CC click needed. Browser audio capture will begin shortly.
+          </div>
+
+          <div class="ai-section ai-section-compact">
+            <div class="ai-section-title">Languages</div>
+            <div class="ai-lang-simple">
+              <div class="ai-lang-row">
+                <label for="ai-display-lang">You read</label>
                 <select id="ai-display-lang">${langOptions(LANGUAGES)}</select>
               </div>
-              <div class="ai-lang-select">
-                <label>Your Output Language</label>
-                <select id="ai-self-lang">${langOptions(LANGUAGES)}</select>
-              </div>
-              <div class="ai-lang-select ai-lang-full">
-                <label>Language for Client (Your Speech → Client Hears)</label>
+              <div class="ai-lang-row">
+                <label for="ai-client-comm-lang">Client hears you</label>
                 <select id="ai-client-comm-lang">${langOptions(LANGUAGES)}</select>
               </div>
-              <div class="ai-lang-select">
-                <label>Client Speaks</label>
+            </div>
+            <div class="ai-client-lang" id="ai-client-lang-badge">
+              Client speaks: <strong id="ai-client-lang-label">English</strong>
+            </div>
+            <details class="ai-advanced-settings">
+              <summary>More options</summary>
+              <div class="ai-lang-row">
+                <label for="ai-self-lang">Your output</label>
+                <select id="ai-self-lang">${langOptions(LANGUAGES)}</select>
+              </div>
+              <div class="ai-lang-row">
+                <label for="ai-client-input-lang">Client input</label>
                 <select id="ai-client-input-lang">${langOptions(INPUT_LANGUAGES)}</select>
               </div>
-              <div class="ai-lang-select">
-                <label>You Speak</label>
+              <div class="ai-lang-row">
+                <label for="ai-self-input-lang">Your input</label>
                 <select id="ai-self-input-lang">${langOptions(INPUT_LANGUAGES)}</select>
               </div>
-            </div>
-            <div class="ai-client-lang" id="ai-client-comm-badge">
-              Client hears you in: <strong id="ai-client-comm-label">English</strong>
-            </div>
-            <div class="ai-client-lang" id="ai-client-lang-badge" hidden>
-              Client detected: <strong id="ai-client-lang-label">English</strong>
-            </div>
+              <div class="ai-toggle-row">
+                <span>Auto-translate</span>
+                <label class="ai-switch">
+                  <input type="checkbox" id="ai-auto-translate" checked />
+                  <span class="ai-switch-slider"></span>
+                </label>
+              </div>
+              <div class="ai-toggle-row">
+                <span>Auto-voice</span>
+                <label class="ai-switch">
+                  <input type="checkbox" id="ai-auto-speak" checked />
+                  <span class="ai-switch-slider"></span>
+                </label>
+              </div>
+              <div class="ai-section-title" style="margin-top:10px">Text AI providers</div>
+              <div class="ai-toggle-row">
+                <span>OpenAI text AI</span>
+                <label class="ai-switch">
+                  <input type="checkbox" id="ai-openai-text-enabled" />
+                  <span class="ai-switch-slider"></span>
+                </label>
+              </div>
+              <div class="ai-toggle-row">
+                <span>Claude text AI</span>
+                <label class="ai-switch">
+                  <input type="checkbox" id="ai-claude-text-enabled" />
+                  <span class="ai-switch-slider"></span>
+                </label>
+              </div>
+              <p class="ai-hint">OFF = Gemini handles text automatically.</p>
+            </details>
           </div>
 
-          <div class="ai-section">
-            <div class="ai-section-title">Meeting Session</div>
+          <div class="ai-section ai-section-compact">
+            <div class="ai-section-title">Meeting</div>
             <div class="ai-session-row">
-              <button class="ai-session-btn" id="ai-start-video" type="button">⏺ Record Video</button>
-              <button class="ai-session-btn danger" id="ai-end-meeting" type="button">⏹ End & Archive</button>
+              <button class="ai-session-btn" id="ai-start-video" type="button" title="Record video">⏺</button>
+              <button class="ai-session-btn danger" id="ai-end-meeting" type="button" title="End & archive">⏹</button>
+              <button type="button" class="ai-session-btn" id="ai-enable-mic" hidden title="Enable mic">🎤</button>
+              <button type="button" class="ai-session-btn" id="ai-start-tab-audio" title="Capture meeting audio">🔊</button>
             </div>
-            <p class="ai-hint" id="ai-recording-status">Captures full conversation in real time. Video archives to your Downloads folder.</p>
+            <p class="ai-hint" id="ai-recording-status">Auto live caption — no CC click needed.</p>
           </div>
 
-          <div class="ai-section">
-            <div class="ai-section-title">Participants</div>
+          <div class="ai-section ai-section-compact">
+            <div class="ai-section-title">Speaker</div>
             <div class="ai-participant-list" id="ai-participant-list"></div>
             <div class="ai-participant-add">
-              <input type="text" id="ai-new-participant-name" placeholder="Name (e.g. Client 2)" />
-              <select id="ai-new-participant-role">
-                <option value="client">Client</option>
-                <option value="colleague">Colleague</option>
-                <option value="self">You</option>
-              </select>
+              <input type="text" id="ai-new-participant-name" placeholder="Add participant" />
               <button type="button" id="ai-add-participant" class="ai-add-btn">+</button>
             </div>
-            <p class="ai-hint">Select who is speaking. Alt+1–9 for quick switch.</p>
-          </div>
-
-          <div class="ai-section">
-            <div class="ai-section-title">Controls</div>
-            <div class="ai-toggle-row">
-              <span>Response panel</span>
+            <div class="ai-toggle-row" style="margin-top:8px">
+              <span>Show response panel</span>
               <label class="ai-switch">
                 <input type="checkbox" id="ai-responses-toggle" />
                 <span class="ai-switch-slider"></span>
               </label>
             </div>
-            <div class="ai-toggle-row">
-              <span>Auto-translate</span>
-              <label class="ai-switch">
-                <input type="checkbox" id="ai-auto-translate" checked />
-                <span class="ai-switch-slider"></span>
-              </label>
-            </div>
-            <div class="ai-toggle-row">
-              <span>Auto-voice to meeting</span>
-              <label class="ai-switch">
-                <input type="checkbox" id="ai-auto-speak" checked />
-                <span class="ai-switch-slider"></span>
-              </label>
-            </div>
-            <p class="ai-hint ai-stealth-hide">Your voice is sent directly into the call — mic + speech, no extra software.</p>
+          </div>
           </div>
 
-          <div class="ai-section" style="padding-bottom:4px;">
-            <div class="ai-section-title">Live Transcript</div>
+          <div class="ai-transcript-panel">
+            <div class="ai-transcript-header">
+              <div class="ai-section-title">Live Transcript</div>
+              <span class="ai-transcript-count" id="ai-transcript-count">0 messages</span>
+            </div>
+            <div class="ai-transcript" id="ai-transcript"></div>
           </div>
-          <div class="ai-transcript" id="ai-transcript"></div>
         </div>
 
         <button class="ai-response-btn" id="ai-generate-btn">Suggest Response</button>
@@ -213,10 +422,132 @@
     await initMeetingSession();
     loadConversationHistory();
     loadBidDocument();
-    ensureImageAnalysis();
-    startSpeechRecognition();
+    startClientSpeechCapture();
+    requestMicAndStart();
     applyStealthLayout();
     autoConfigureVoice();
+    startHealthCheck();
+    startMeetingKeepAlive();
+    scheduleDeferredWork();
+    window.addEventListener('beforeunload', stopMeetingKeepAlive);
+  }
+
+  function scheduleDeferredWork() {
+    setTimeout(() => ensureImageAnalysis(), 30000);
+    startAutomaticLiveCapture();
+  }
+
+  function startAutomaticLiveCapture() {
+    startCaptionAutoEnableLoop();
+    refreshAllVideoTextTracks();
+
+    setTimeout(() => {
+      if (!tabAudioLoopActive) startTabAudioTranscription();
+    }, 4000);
+
+    setTimeout(() => {
+      if (conversation.length > 0 || tabAudioLoopActive) return;
+      const status = document.getElementById('ai-recording-status');
+      if (status && !tabAudioLoopActive) {
+        status.textContent = 'Starting browser audio capture (no CC click needed)…';
+      }
+      if (!tabAudioLoopActive) startTabAudioTranscription();
+    }, 8000);
+  }
+
+  function sendCaptionKeyboardShortcut() {
+    const evtInit = { key: 'c', code: 'KeyC', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true };
+    document.dispatchEvent(new KeyboardEvent('keydown', evtInit));
+    document.dispatchEvent(new KeyboardEvent('keyup', evtInit));
+  }
+
+  function clickCaptionToggle(btn) {
+    if (!btn || isExtensionNode(btn)) return false;
+    const pressed = btn.getAttribute('aria-pressed');
+    const checked = btn.getAttribute('aria-checked');
+    const isOff = pressed === 'false' || checked === 'false';
+    if (pressed === 'true' || checked === 'true') {
+      meetCaptionsActive = true;
+      return true;
+    }
+    if (isOff || pressed === null) {
+      btn.click();
+      meetCaptionsActive = true;
+      return true;
+    }
+    return false;
+  }
+
+  function tryEnableMeetCaptions() {
+    if (!location.hostname.includes('meet.google.com')) return false;
+
+    sendCaptionKeyboardShortcut();
+
+    const selectors = [
+      'button[jsname="r8qRAd"]',
+      '[aria-label*="Turn on captions" i]',
+      '[aria-label*="Turn off captions" i]',
+      '[aria-label*="caption" i]',
+      '[aria-label*="subtitle" i]',
+      '[aria-label*="字幕" i]',
+      '[aria-label*="キャプション" i]',
+      '[data-tooltip*="caption" i]',
+      '[data-tooltip*="字幕" i]',
+      '[data-tooltip*="キャプション" i]'
+    ];
+
+    for (const sel of selectors) {
+      const btn = document.querySelector(sel);
+      if (clickCaptionToggle(btn)) return true;
+    }
+
+    const buttons = document.querySelectorAll('button,[role="button"],[role="menuitem"]');
+    for (const btn of buttons) {
+      const label = `${btn.getAttribute('aria-label') || ''} ${btn.getAttribute('data-tooltip') || ''} ${btn.textContent || ''}`.toLowerCase();
+      if (/caption|subtitle|字幕|キャプション|\bcc\b/.test(label)) {
+        if (clickCaptionToggle(btn)) return true;
+      }
+    }
+    return meetCaptionsActive;
+  }
+
+  function startCaptionAutoEnableLoop() {
+    if (captionAutoEnableTimer) clearInterval(captionAutoEnableTimer);
+    let attempts = 0;
+    const tryOnce = () => {
+      tryEnableMeetCaptions();
+      refreshAllVideoTextTracks();
+      attempts += 1;
+      if (meetCaptionsActive || conversation.length > 0 || attempts >= 18) {
+        clearInterval(captionAutoEnableTimer);
+        captionAutoEnableTimer = null;
+        const hint = document.getElementById('ai-caption-hint');
+        if (hint) hint.hidden = true;
+      }
+    };
+    tryOnce();
+    captionAutoEnableTimer = setInterval(tryOnce, 5000);
+  }
+
+  function refreshAllVideoTextTracks() {
+    document.querySelectorAll('video').forEach((video) => {
+      attachVideoCaptionTracks(video);
+      const tracks = video.textTracks;
+      if (!tracks?.length) return;
+      for (let i = 0; i < tracks.length; i++) {
+        const track = tracks[i];
+        if (track.kind === 'captions' || track.kind === 'subtitles') {
+          track.mode = 'hidden';
+        }
+      }
+    });
+  }
+
+  function startHealthCheck() {
+    if (healthCheckTimer) clearInterval(healthCheckTimer);
+    healthCheckTimer = setInterval(() => {
+      checkApiStatus();
+    }, 45000);
   }
 
   function initAudioBridge() {
@@ -338,7 +669,13 @@
     });
 
     document.getElementById('ai-display-lang').addEventListener('change', (e) => {
-      saveSetting('displayLanguage', e.target.value);
+      const lang = e.target.value;
+      saveSetting('displayLanguage', lang);
+      const selfLang = document.getElementById('ai-self-lang');
+      if (selfLang && selfLang.value !== lang) {
+        selfLang.value = lang;
+        saveSetting('selfOutputLanguage', lang);
+      }
     });
 
     document.getElementById('ai-self-lang').addEventListener('change', (e) => {
@@ -347,7 +684,6 @@
 
     document.getElementById('ai-client-comm-lang').addEventListener('change', (e) => {
       saveSetting('clientCommunicationLanguage', e.target.value);
-      updateClientCommBadge(e.target.value);
     });
 
     document.getElementById('ai-client-input-lang').addEventListener('change', (e) => {
@@ -362,9 +698,11 @@
       if (getActiveParticipant()?.role === 'self') updateRecognitionLanguage();
     });
 
-    document.getElementById('ai-responses-toggle').addEventListener('change', (e) => {
-      saveSetting('responsesEnabled', e.target.checked);
-      toggleModal(e.target.checked);
+    document.getElementById('ai-responses-toggle').addEventListener('change', async (e) => {
+      const enabled = e.target.checked;
+      settings.responsesEnabled = enabled;
+      await sendMessage('SETTINGS_UPDATED', { responsesEnabled: enabled });
+      setResponsePanelVisible(enabled, { syncToggle: true });
     });
 
     document.getElementById('ai-auto-translate').addEventListener('change', (e) => {
@@ -374,11 +712,24 @@
     document.getElementById('ai-auto-speak').addEventListener('change', (e) => {
       saveSetting('autoSpeakResponses', e.target.checked);
     });
+    document.getElementById('ai-openai-text-enabled')?.addEventListener('change', (e) => {
+      saveSetting('openaiTextAiEnabled', e.target.checked);
+      checkApiStatus();
+    });
+    document.getElementById('ai-claude-text-enabled')?.addEventListener('change', (e) => {
+      saveSetting('claudeTextAiEnabled', e.target.checked);
+      checkApiStatus();
+    });
     document.getElementById('ai-add-participant').addEventListener('click', addParticipant);
+    document.getElementById('ai-enable-mic').addEventListener('click', () => requestMicAndStart(true));
+    document.getElementById('ai-start-tab-audio').addEventListener('click', () => startTabAudioTranscription());
     document.getElementById('ai-start-video').addEventListener('click', toggleVideoRecording);
     document.getElementById('ai-end-meeting').addEventListener('click', endMeetingAndArchive);
 
-    document.getElementById('ai-generate-btn').addEventListener('click', () => generateAIResponse());
+    document.getElementById('ai-generate-btn').addEventListener('click', () => {
+      clearTimeout(responseDebounceTimer);
+      generateAIResponse(null, null, { immediate: true });
+    });
     document.getElementById('ai-export-btn').addEventListener('click', exportTranscript);
     document.getElementById('ai-modal-close').addEventListener('click', () => closeModal());
     document.getElementById('ai-meeting-modal-backdrop').addEventListener('click', () => closeModal());
@@ -450,7 +801,7 @@
     const name = nameInput.value.trim();
     if (!name) return;
 
-    const role = roleSelect.value;
+    const role = roleSelect?.value || 'client';
     const id = `${role}-${Date.now()}`;
     if (role === 'self' && participants.some((p) => p.role === 'self')) {
       alert('Only one "You" participant is allowed.');
@@ -495,14 +846,20 @@
       document.getElementById('ai-responses-toggle').checked = settings.responsesEnabled || false;
       document.getElementById('ai-auto-translate').checked = settings.autoTranslate !== false;
       document.getElementById('ai-auto-speak').checked = settings.autoSpeakResponses || false;
-      updateClientCommBadge(settings.clientCommunicationLanguage || settings.clientLanguage || 'en');
+      const openaiText = document.getElementById('ai-openai-text-enabled');
+      const claudeText = document.getElementById('ai-claude-text-enabled');
+      if (openaiText) openaiText.checked = settings.openaiTextAiEnabled !== false;
+      if (claudeText) claudeText.checked = settings.claudeTextAiEnabled !== false;
       updateClientLanguageBadge(settings.clientLanguage || 'en');
       updateModalSections(settings.clientLanguage || 'en');
       participants = settings.participants || participants;
       currentParticipantId = settings.currentParticipantId || currentParticipantId;
       renderParticipantList();
-      if (settings.responsesEnabled) toggleModal(true);
-      else if (settings.stealthMode !== false) toggleModal(false);
+      if (settings.responsesEnabled) {
+        setResponsePanelVisible(true, { syncToggle: true });
+      } else if (settings.stealthMode !== false) {
+        setResponsePanelVisible(false, { syncToggle: true });
+      }
     } catch (err) {
       console.error('Failed to load settings:', err);
     }
@@ -511,34 +868,47 @@
   async function checkApiStatus() {
     try {
       const status = await sendMessage('GET_API_STATUS');
-      const warning = document.getElementById('ai-api-warning');
-      warning.hidden = status.configured;
+      const apiWarning = document.getElementById('ai-api-warning');
       const voiceWarning = document.getElementById('ai-voice-warning');
-      if (voiceWarning) voiceWarning.hidden = status.voiceConfigured;
-    } catch {
-      /* ignore */
+      const captionHint = document.getElementById('ai-caption-hint');
+
+      if (apiWarning) {
+        apiWarning.hidden = status.textAiConfigured || status.configured;
+        if (!apiWarning.hidden && !status.geminiConfigured) {
+          apiWarning.textContent =
+            'Add Gemini API key in extension popup → API Settings (primary text AI).';
+        }
+      }
+      if (voiceWarning) {
+        voiceWarning.hidden = status.voiceConfigured;
+        if (!voiceWarning.hidden && status.textAiConfigured) {
+          voiceWarning.textContent =
+            'Speech needs OpenAI API key — popup → API Settings (even when using Claude for text).';
+        }
+      }
+      if (captionHint && location.hostname.includes('meet.google.com')) {
+        captionHint.hidden = conversation.length > 0 || captionMissCount < 8;
+      }
+    } catch (err) {
+      if (!isExtensionInvalidated(err)) {
+        console.warn('API status check:', err.message);
+      }
     }
   }
 
-  function updateClientCommBadge(code) {
-    const label = document.getElementById('ai-client-comm-label');
-    if (label) label.textContent = LANG_LABELS[code] || code;
-  }
-
   function updateClientLanguageBadge(code) {
-    const badge = document.getElementById('ai-client-lang-badge');
     const label = document.getElementById('ai-client-lang-label');
-    if (!badge || !label) return;
+    if (!label) return;
     label.textContent = LANG_LABELS[code] || code;
-    badge.hidden = false;
   }
 
   async function saveSetting(key, value) {
     settings[key] = value;
     await sendMessage('SETTINGS_UPDATED', { [key]: value });
-    if (key === 'responsesEnabled') toggleModal(value);
+    if (key === 'responsesEnabled') {
+      setResponsePanelVisible(value, { syncToggle: true });
+    }
     if (key === 'clientLanguage') updateModalSections(value);
-    if (key === 'clientCommunicationLanguage') updateClientCommBadge(value);
   }
 
   function getLegacySpeaker(role) {
@@ -586,8 +956,17 @@
       btn.textContent = '⏹ Stop Video';
       btn.classList.add('recording');
       status.textContent = 'Recording meeting video + audio...';
+      if (!tabAudioLoopActive) {
+        tabAudioStream = captureStream;
+        startTabAudioTranscription();
+      }
     } catch (err) {
-      status.textContent = `Video recording failed: ${err.message}`;
+      const msg = err.message || 'Video recording failed';
+      if (isPermanentInvalidation(err)) {
+        status.textContent = 'Extension updated — refresh page (F5), then try again';
+      } else {
+        status.textContent = `Video recording failed: ${msg}`;
+      }
     }
   }
 
@@ -625,6 +1004,7 @@
     const btn = document.getElementById('ai-end-meeting');
     const status = document.getElementById('ai-recording-status');
     btn.disabled = true;
+    stopMeetingKeepAlive();
     status.textContent = 'Archiving meeting — analyzing with AI...';
 
     try {
@@ -682,18 +1062,26 @@
     if (backdrop) backdrop.style.right = `${sidebarWidth}px`;
   }
 
-  function toggleModal(show) {
+  function setResponsePanelVisible(show, options = {}) {
+    const { syncToggle = false } = options;
+    responsePanelVisible = show;
     const modal = document.getElementById('ai-meeting-modal');
     const backdrop = document.getElementById('ai-meeting-modal-backdrop');
-    modal.classList.toggle('visible', show);
-    backdrop.classList.toggle('visible', show);
-    document.getElementById('ai-responses-toggle').checked = show;
+    if (modal) modal.classList.toggle('visible', show);
+    if (backdrop) backdrop.classList.toggle('visible', show);
+    if (syncToggle) {
+      const toggle = document.getElementById('ai-responses-toggle');
+      if (toggle) toggle.checked = show;
+    }
     if (show) updateModalLayout();
   }
 
-  async function closeModal() {
-    toggleModal(false);
-    await saveSetting('responsesEnabled', false);
+  function toggleModal(show) {
+    setResponsePanelVisible(show, { syncToggle: true });
+  }
+
+  function closeModal() {
+    setResponsePanelVisible(false, { syncToggle: false });
   }
 
   function updateModalSections(clientLanguage) {
@@ -712,6 +1100,7 @@
       const container = document.getElementById('ai-transcript');
       container.innerHTML = '';
       history.forEach((entry) => renderTranscriptEntry(entry));
+      updateTranscriptCount();
     } catch (err) {
       console.error('Failed to load conversation:', err);
     }
@@ -808,6 +1197,374 @@
     }, 200);
   }
 
+  async function requestMicAndStart(force) {
+    const micBtn = document.getElementById('ai-enable-mic');
+    const status = document.getElementById('ai-recording-status');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream.getTracks().forEach((t) => t.stop());
+      if (micBtn) micBtn.hidden = true;
+      if (!isListening) startSpeechRecognition();
+      else restartRecognition();
+    } catch (err) {
+      const noMic =
+        err.name === 'NotAllowedError' ||
+        err.name === 'NotFoundError' ||
+        /not found|not found/i.test(err.message || '');
+      if (micBtn) micBtn.hidden = !noMic;
+      if (noMic) {
+        const msg = 'No mic — auto live caption via browser audio (no CC click needed).';
+        setStatus(msg, true);
+        if (status) status.textContent = msg;
+        startCaptionAutoEnableLoop();
+        if (!tabAudioLoopActive) startTabAudioTranscription();
+      } else {
+        setStatus(`Mic error: ${err.message}`, false);
+        if (!force) startSpeechRecognition();
+      }
+    }
+  }
+
+  function getClientParticipantId() {
+    return (
+      participants.find((p) => p.role === 'client')?.id ||
+      currentParticipantId ||
+      'client-1'
+    );
+  }
+
+  function looksLikeCompleteUtterance(text) {
+    const t = String(text || '').trim();
+    if (t.length < 6) return false;
+    if (/[?？]$/.test(t)) return true;
+    if (/ですか|ますか|でしょうか|ください|どうですか|ませんか/.test(t)) return true;
+    if (/^(what|how|why|when|where|who|can you|could you|do you|is there|are there)\b/i.test(t)) {
+      return t.length > 10;
+    }
+    if (/^(はい|そうですね|なるほど|わかりました|thank you|thanks)\b/i.test(t) && t.length < 100) {
+      return true;
+    }
+    return t.length >= 45;
+  }
+
+  function bufferClientSpeech(text, source) {
+    const cleaned = String(text || '').trim();
+    if (!cleaned || cleaned.length < 2) return;
+
+    lastBufferSource = source;
+    if (!clientSpeechBuffer) {
+      clientSpeechBuffer = cleaned;
+    } else if (cleaned.includes(clientSpeechBuffer) || clientSpeechBuffer.includes(cleaned)) {
+      clientSpeechBuffer = cleaned.length >= clientSpeechBuffer.length ? cleaned : clientSpeechBuffer;
+    } else {
+      clientSpeechBuffer = `${clientSpeechBuffer} ${cleaned}`.trim();
+    }
+
+    const status = document.getElementById('ai-recording-status');
+    if (status) {
+      const waiting = looksLikeCompleteUtterance(clientSpeechBuffer) ? 'finishing…' : 'listening…';
+      status.textContent = `Client ${waiting}: ${clientSpeechBuffer.slice(0, 48)}…`;
+    }
+
+    clearTimeout(clientSpeechFlushTimer);
+    const pauseMs = looksLikeCompleteUtterance(clientSpeechBuffer)
+      ? SPEECH_PAUSE_QUESTION_MS
+      : SPEECH_PAUSE_MS;
+
+    clientSpeechFlushTimer = setTimeout(() => {
+      const utterance = clientSpeechBuffer.trim();
+      clientSpeechBuffer = '';
+      clientSpeechFlushTimer = null;
+      if (utterance.length >= 2) ingestClientSpeech(utterance, lastBufferSource);
+    }, pauseMs);
+  }
+
+  async function ingestClientSpeech(text, source) {
+    const cleaned = String(text || '').trim();
+    if (!cleaned || cleaned.length < 2) return;
+
+    const clientId = getClientParticipantId();
+    if (currentParticipantId !== clientId) {
+      await setActiveParticipant(clientId);
+    }
+
+    const status = document.getElementById('ai-recording-status');
+    if (status) status.textContent = `Client (${source}): ${cleaned.slice(0, 50)}…`;
+
+    await handleTranscript(cleaned);
+  }
+
+  function isExtensionNode(el) {
+    return Boolean(
+      el.closest?.(
+        '#ai-meeting-assistant-root, #ai-meeting-sidebar, #ai-meeting-modal, #ai-expand-tab, .ai-response-overlay'
+      )
+    );
+  }
+
+  const CAPTION_NOISE =
+    /^(turn on captions|subtitles|captions|cc$|listening|assist|you$|muted|unmute)/i;
+
+  function scrapeMeetCaptions() {
+    const found = [];
+    const seen = new Set();
+
+    const push = (text, speaker) => {
+      const cleaned = String(text || '').trim();
+      if (cleaned.length < 2 || cleaned.length > 600) return;
+      if (CAPTION_NOISE.test(cleaned)) return;
+      const key = `${speaker || ''}:${cleaned}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      found.push({ text: cleaned, speaker: speaker || null });
+    };
+
+    const selectors = [
+      '.iOzk7',
+      '.a4cQT',
+      '.CNusmb',
+      '.pSNTSe',
+      '.TBMuR',
+      '.bh44bd',
+      '.yf5fkd',
+      '[data-message-text]',
+      'div[jsname="bkFQOd"]',
+      'div[jsname="tgaKEf"]',
+      'div[jsname="WbKHeb"]',
+      'div[jsname="dsyhDe"]',
+      'span[jsname="WbKHeb"]'
+    ];
+
+    selectors.forEach((sel) => {
+      document.querySelectorAll(sel).forEach((el) => {
+        if (isExtensionNode(el)) return;
+        push(el.textContent, null);
+      });
+    });
+
+    document.querySelectorAll('[data-self-name]').forEach((el) => {
+      if (isExtensionNode(el)) return;
+      const speaker = el.getAttribute('data-self-name') || '';
+      const text = (el.textContent || '').replace(speaker, '').trim();
+      push(text, speaker);
+    });
+
+    document
+      .querySelectorAll(
+        '[aria-label*="caption" i], [aria-label*="subtitle" i], [aria-label*="字幕" i]'
+      )
+      .forEach((root) => {
+        if (isExtensionNode(root)) return;
+        root.querySelectorAll('div, span').forEach((el) => {
+          if (el.children.length > 2) return;
+          push(el.textContent, null);
+        });
+      });
+
+    document.querySelectorAll('[aria-live="polite"], [aria-live="assertive"]').forEach((el) => {
+      if (isExtensionNode(el)) return;
+      if (el.closest('[role="log"]') || el.getAttribute('aria-live')) {
+        push(el.textContent, null);
+      }
+    });
+
+    document.querySelectorAll('[role="log"], [role="status"]').forEach((el) => {
+      if (isExtensionNode(el)) return;
+      push(el.textContent, null);
+    });
+
+    document
+      .querySelectorAll('[class*="caption" i], [class*="subtitle" i], [id*="caption" i]')
+      .forEach((el) => {
+        if (isExtensionNode(el)) return;
+        if (el.children.length > 4) return;
+        push(el.textContent, null);
+      });
+
+    return found;
+  }
+
+  function isLikelySelfSpeaker(name) {
+    if (!name) return false;
+    const lower = name.toLowerCase();
+    return lower.includes('you') || lower === 'あなた' || name === selfDisplayName;
+  }
+
+  function attachVideoCaptionTracks(video) {
+    if (!video || video.__aiCaptionAttached) return;
+    video.__aiCaptionAttached = true;
+
+    const bindTracks = () => {
+      const tracks = video.textTracks;
+      if (!tracks?.length) return;
+      for (let i = 0; i < tracks.length; i++) {
+        const track = tracks[i];
+        if (track.kind !== 'captions' && track.kind !== 'subtitles') continue;
+        if (track.__aiBound) continue;
+        track.__aiBound = true;
+        track.mode = 'hidden';
+        track.addEventListener('cuechange', () => {
+          const cues = track.activeCues;
+          if (!cues) return;
+          for (let j = 0; j < cues.length; j++) {
+            const text = cues[j].text?.trim();
+            if (text) bufferClientSpeech(text, 'captions-vtt');
+          }
+        });
+      }
+    };
+
+    video.addEventListener('loadedmetadata', bindTracks);
+    video.addEventListener('emptied', bindTracks);
+    bindTracks();
+  }
+
+  function scheduleVttVideoScan() {
+    if (vttScanScheduled) return;
+    vttScanScheduled = true;
+    setTimeout(() => {
+      vttScanScheduled = false;
+      document.querySelectorAll('video').forEach(attachVideoCaptionTracks);
+    }, 2000);
+  }
+
+  function startVideoCaptionCapture() {
+    document.querySelectorAll('video').forEach(attachVideoCaptionTracks);
+    if (vttCaptionObserver) return;
+    vttCaptionObserver = new MutationObserver(scheduleVttVideoScan);
+    vttCaptionObserver.observe(document.body, { childList: true, subtree: true });
+  }
+
+  function startMeetCaptionCapture() {
+    if (!location.hostname.includes('meet.google.com')) return;
+
+    const tick = () => {
+      refreshAllVideoTextTracks();
+      const caps = scrapeMeetCaptions();
+      const now = Date.now();
+      if (!caps.length) {
+        captionMissCount += 1;
+        if (captionMissCount === 4) tryEnableMeetCaptions();
+        return;
+      }
+      for (const cap of caps) {
+        if (isLikelySelfSpeaker(cap.speaker)) continue;
+        const key = `${cap.speaker || ''}:${cap.text}`;
+        if (key === lastCaptionKey && now - lastCaptionAt < 2500) continue;
+
+        lastCaptionKey = key;
+        lastCaptionAt = now;
+        captionMissCount = 0;
+        const captionHint = document.getElementById('ai-caption-hint');
+        if (captionHint) captionHint.hidden = true;
+        bufferClientSpeech(cap.text, 'captions');
+        break;
+      }
+    };
+
+    if (captionPollTimer) clearTimeout(captionPollTimer);
+    const pollMs = () => (captionMissCount < 15 ? 1500 : 2500);
+    const scheduleTick = () => {
+      tick();
+      captionPollTimer = setTimeout(scheduleTick, pollMs());
+    };
+    scheduleTick();
+    setStatus('Auto live caption listening…', true);
+  }
+
+  function blobToBase64(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result).split(',')[1]);
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  async function transcribeTabAudioChunk() {
+    if (!tabAudioStream) return;
+    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+      ? 'audio/webm;codecs=opus'
+      : 'audio/webm';
+
+    const recorder = new MediaRecorder(tabAudioStream, { mimeType });
+    const chunks = [];
+
+    await new Promise((resolve) => {
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunks.push(e.data);
+      };
+      recorder.onstop = resolve;
+      recorder.start();
+      setTimeout(() => {
+        try {
+          recorder.stop();
+        } catch {
+          resolve();
+        }
+      }, 4500);
+    });
+
+    const blob = new Blob(chunks, { type: mimeType });
+    if (blob.size < 8000) return;
+
+    const audioBase64 = await blobToBase64(blob);
+    const langHint = settings.clientInputLanguage || 'auto';
+    const result = await sendMessage('TRANSCRIBE_AUDIO', { audioBase64, mimeType, langHint });
+    const text = result?.text?.trim();
+    if (!text || text.length < 2 || text === lastWhisperText) return;
+
+    lastWhisperText = text;
+    await ingestClientSpeech(text, 'tab-audio');
+  }
+
+  async function startTabAudioTranscription() {
+    if (tabAudioLoopActive) return;
+    const status = document.getElementById('ai-recording-status');
+    const btn = document.getElementById('ai-start-tab-audio');
+    try {
+      if (!tabAudioStream) {
+        const { streamId } = await sendMessage('GET_TAB_CAPTURE_STREAM_ID');
+        tabAudioStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            mandatory: {
+              chromeMediaSource: 'tab',
+              chromeMediaSourceId: streamId
+            }
+          },
+          video: false
+        });
+      }
+      tabAudioLoopActive = true;
+      if (btn) btn.textContent = '🔊 Listening to meeting audio…';
+      if (status) status.textContent = 'Browser live caption active — transcribing meeting audio…';
+
+      const loop = async () => {
+        if (!tabAudioLoopActive) return;
+        try {
+          await transcribeTabAudioChunk();
+        } catch (err) {
+          console.warn('Tab audio transcription:', err.message);
+        }
+        setTimeout(loop, 6000);
+      };
+      loop();
+    } catch (err) {
+      if (isPermanentInvalidation(err)) {
+        if (status) status.textContent = 'Extension updated — refresh page (F5)';
+      } else if (status) {
+        status.textContent = `Audio capture failed: ${err.message}. Retrying automatically…`;
+        setTimeout(() => startTabAudioTranscription(), 8000);
+      }
+      console.warn('Tab audio capture unavailable:', err.message);
+    }
+  }
+
+  function startClientSpeechCapture() {
+    startVideoCaptionCapture();
+    startMeetCaptionCapture();
+  }
+
   function startSpeechRecognition() {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) {
@@ -834,8 +1591,15 @@
     };
 
     recognition.onerror = (event) => {
-      if (event.error !== 'no-speech') {
-        setStatus(`Error: ${event.error}`, false);
+      if (event.error === 'not-allowed') {
+        setStatus('Mic blocked — use Meet CC captions or click Enable Microphone', false);
+        const micBtn = document.getElementById('ai-enable-mic');
+        if (micBtn) micBtn.hidden = false;
+        isListening = false;
+        return;
+      }
+      if (event.error !== 'no-speech' && event.error !== 'aborted') {
+        setStatus(`Speech: ${event.error}`, false);
       }
     };
 
@@ -850,6 +1614,35 @@
       document.getElementById('ai-status-dot').classList.add('recording');
     } catch {
       setStatus('Mic access required', false);
+    }
+  }
+
+  function applyTranscriptSideEffects(entry, participantRole, text) {
+    if (
+      entry.participantRole !== 'self' &&
+      entry.detectedLanguage &&
+      entry.detectedLanguage !== 'unknown'
+    ) {
+      const lang = entry.detectedLanguage;
+      if (settings.clientLanguage !== lang) {
+        settings.clientLanguage = lang;
+        updateClientLanguageBadge(lang);
+        updateModalSections(lang);
+      }
+      if (
+        recognition &&
+        (settings.clientInputLanguage || 'auto') === 'auto' &&
+        participantRole !== 'self'
+      ) {
+        recognition.lang = SPEECH_LANG_MAP[lang] || 'en-US';
+      }
+    }
+
+    if (participantRole !== 'self') {
+      if (settings.responsesEnabled) {
+        setResponsePanelVisible(true, { syncToggle: false });
+      }
+      scheduleAIResponse(text, entry);
     }
   }
 
@@ -874,33 +1667,40 @@
         renderTranscriptEntry(result.entry);
         setStatus('Listening...', true);
 
-        if (
-          result.entry.participantRole !== 'self' &&
-          result.entry.detectedLanguage &&
-          result.entry.detectedLanguage !== 'unknown'
-        ) {
-          const lang = result.entry.detectedLanguage;
-          if (settings.clientLanguage !== lang) {
-            settings.clientLanguage = lang;
-            updateClientLanguageBadge(lang);
-            updateModalSections(lang);
-          }
-          if (
-            (settings.clientInputLanguage || 'auto') === 'auto' &&
-            participantRole !== 'self'
-          ) {
-            recognition.lang = SPEECH_LANG_MAP[lang] || 'en-US';
-          }
-        }
-
-        if (participantRole !== 'self' && (settings.responsesEnabled || settings.autoSpeakResponses)) {
-          scheduleAIResponse(text, result.entry);
+        try {
+          applyTranscriptSideEffects(result.entry, participantRole, text);
+        } catch (sideErr) {
+          console.warn('Transcript side effect:', sideErr);
         }
       }
     } catch (err) {
+      if (isPermanentInvalidation(err)) {
+        console.error('Transcript error:', err);
+        setStatus('Extension updated — refresh page (F5)', false);
+        return;
+      }
+
+      if (isTransientConnectionError(err)) {
+        const localId = crypto.randomUUID();
+        const fallback = {
+          ...entry,
+          id: localId,
+          timestamp: Date.now(),
+          translatedText: text,
+          pendingSync: true
+        };
+        conversation.push(fallback);
+        renderTranscriptEntry(fallback);
+        queueTranscriptUpdate(entry, localId, participantRole !== 'self');
+        setStatus('Reconnecting… speech saved', true);
+        return;
+      }
+
       console.error('Transcript error:', err);
       const fallback = {
         ...entry,
+        id: crypto.randomUUID(),
+        timestamp: Date.now(),
         translatedText: text,
         translationError: err.message || 'Processing failed'
       };
@@ -912,10 +1712,9 @@
 
   function scheduleAIResponse(clientMessage, entry) {
     clearTimeout(responseDebounceTimer);
-    responseDebounceTimer = setTimeout(
-      () => generateAIResponse(clientMessage, entry),
-      1200
-    );
+    responseDebounceTimer = setTimeout(() => {
+      generateAIResponse(clientMessage, entry);
+    }, RESPONSE_DELAY_MS);
   }
 
   function formatTime(ts) {
@@ -923,12 +1722,7 @@
     return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
 
-  function renderTranscriptEntry(entry) {
-    const container = document.getElementById('ai-transcript');
-    const div = document.createElement('div');
-    div.className = `ai-transcript-entry ${entry.participantRole || entry.speaker || 'client'}`;
-    div.dataset.entryId = entry.id || '';
-
+  function buildTranscriptEntryHtml(entry) {
     const speakerLabel = entry.participantName ||
       (entry.speaker === 'self' ? 'You' : 'Client');
     const displayText = entry.translatedText || entry.originalText;
@@ -943,17 +1737,39 @@
     const clientFacing = (entry.participantRole === 'self' || entry.speaker === 'self')
       ? formatClientFacingBlock(entry, clientCommLabel)
       : '';
+    const syncNote = entry.pendingSync
+      ? '<div class="sync-note">Syncing translation…</div>'
+      : '';
     const errorNote = entry.translationError
       ? `<div class="error-note">${escapeHtml(entry.translationError)}</div>`
       : '';
 
-    div.innerHTML = `
+    return `
       <div class="speaker">${speakerLabel}${timeLabel ? ` · ${timeLabel}` : ''}</div>
       <div>${escapeHtml(displayText)}</div>
       ${showOriginal ? `<div class="original">Original: ${escapeHtml(entry.originalText)}</div>` : ''}
       ${clientFacing}
+      ${syncNote}
       ${errorNote}
     `;
+  }
+
+  function refreshTranscriptEntry(entryId, entry) {
+    const el = document.querySelector(`[data-entry-id="${entryId}"]`);
+    if (!el) return;
+    el.innerHTML = buildTranscriptEntryHtml(entry);
+    el.querySelector('.client-facing-copy')?.addEventListener('click', async (e) => {
+      const copyText = e.currentTarget.dataset.text;
+      if (copyText) await navigator.clipboard.writeText(copyText);
+    });
+  }
+
+  function renderTranscriptEntry(entry) {
+    const container = document.getElementById('ai-transcript');
+    const div = document.createElement('div');
+    div.className = `ai-transcript-entry ${entry.participantRole || entry.speaker || 'client'}`;
+    div.dataset.entryId = entry.id || '';
+    div.innerHTML = buildTranscriptEntryHtml(entry);
 
     container.appendChild(div);
     div.querySelector('.client-facing-copy')?.addEventListener('click', async (e) => {
@@ -971,6 +1787,14 @@
       if (text) speakText(text, lang, e.currentTarget);
     });
     container.scrollTop = container.scrollHeight;
+    updateTranscriptCount();
+  }
+
+  function updateTranscriptCount() {
+    const el = document.getElementById('ai-transcript-count');
+    if (!el) return;
+    const n = conversation.length;
+    el.textContent = n === 1 ? '1 message' : `${n} messages`;
   }
 
   function escapeAttr(str) {
@@ -1034,6 +1858,8 @@
 
     try {
       const result = await sendMessage('SYNTHESIZE_VOICE', { text: text.trim(), langCode: lang });
+      const providerLabel = result.provider === 'openai' ? `OpenAI (${result.voice || 'TTS'})` : 'TTS';
+      setStatus(`Speaking via ${providerLabel}...`, true);
       await injectAudioToMeeting(result.audioBase64);
       setStatus('Ready', true);
     } catch (err) {
@@ -1075,29 +1901,42 @@
     history.forEach((entry) => renderTranscriptEntry(entry));
   }
 
-  async function generateAIResponse(clientMessage, sourceEntry) {
+  async function generateAIResponse(clientMessage, sourceEntry, options = {}) {
+    if (responseInFlight && !options.immediate) return;
+
     const btn = document.getElementById('ai-generate-btn');
     btn.disabled = true;
+    responseInFlight = true;
 
     const latestEntry = sourceEntry ||
       [...conversation].reverse().find((e) => (e.participantRole || e.speaker) !== 'self');
     const latestClient = clientMessage || latestEntry?.originalText;
 
     if (!latestClient) {
+      const msg =
+        'No client speech yet. Auto live caption is listening — speak in the meeting.';
+      setStatus(msg, false);
+      const responseEl = document.getElementById('ai-modal-response');
+      const tasksEl = document.getElementById('ai-modal-tasks');
+      if (responseEl) responseEl.textContent = msg;
+      if (tasksEl) tasksEl.textContent = msg;
+      if (settings.responsesEnabled) setResponsePanelVisible(true, { syncToggle: false });
       btn.disabled = false;
+      responseInFlight = false;
       return;
     }
 
-    const showModal = settings.responsesEnabled;
-    if (showModal) toggleModal(true);
+    if (settings.responsesEnabled || options.immediate) {
+      setResponsePanelVisible(true, { syncToggle: false });
+    }
 
     const responseEl = document.getElementById('ai-modal-response');
-    if (showModal) {
+    const showPanel = settings.responsesEnabled || options.immediate;
+    if (showPanel && responseEl) {
       responseEl.innerHTML =
-        '<div class="ai-modal-loading"><div class="ai-spinner"></div> Preparing response...</div>';
-    } else {
-      setStatus('Preparing response...', true);
+        '<div class="ai-modal-loading"><div class="ai-spinner"></div> Generating response (3–6s)...</div>';
     }
+    setStatus('Generating response...', true);
 
     try {
       const result = await sendMessage('GENERATE_RESPONSE', {
@@ -1127,7 +1966,7 @@
           ? `<div class="response-translation">Meaning (${LANG_LABELS[settings.displayLanguage] || 'your language'}): ${escapeHtml(result.responseTranslation)}</div>`
           : '';
       const pronunciationNote = formatPronunciationHtml(result.pronunciationGuide);
-      if (showModal) {
+      if (showPanel) {
         responseEl.innerHTML = `${escapeHtml(lastSuggestedResponse)}${pronunciationNote}${intentNote}${translationNote}`;
       }
 
@@ -1136,15 +1975,20 @@
           lastSuggestedResponse,
           settings.clientCommunicationLanguage || settings.clientLanguage || 'en'
         );
+      } else if (!showPanel) {
+        setStatus('Response ready — click Suggest Response', true);
       } else {
         setStatus('Ready', true);
       }
     } catch (err) {
       lastSuggestedResponse = '';
-      responseEl.textContent = `Error: ${err.message || 'Failed to generate response'}`;
+      const msg = err.message || 'Failed to generate response';
+      if (responseEl && showPanel) responseEl.textContent = msg;
+      setStatus(msg, false);
     }
 
     btn.disabled = false;
+    responseInFlight = false;
   }
 
   function exportTranscript() {
@@ -1222,7 +2066,7 @@
       checkApiStatus();
 
       if (settings.responsesEnabled !== prevResponsesEnabled) {
-        toggleModal(settings.responsesEnabled);
+        setResponsePanelVisible(settings.responsesEnabled, { syncToggle: true });
       }
 
       const inputChanged =

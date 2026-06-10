@@ -4,3 +4,8 @@ Thumbs.db
 .env
 .env.*
 shared/default-config.local.js
+data/*.mp3
+data/*.pdf
+data/*.xlsx
+data/test-tts-output.mp3
+meeting-assist-user-files/

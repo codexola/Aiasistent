@@ -1,102 +1,33 @@
 import { getSettings, saveSettings } from '../shared/storage.js';
+import { OPENAI_TTS_VOICES, OPENAI_TTS_LANG_VOICES } from '../shared/constants.js';
+import { humanizeForTTS } from './speech-humanize.js';
+import { getLockedVoice } from './voice-profile-service.js';
 
-const ELEVENLABS_BASE = 'https://api.elevenlabs.io/v1';
-
-const LANGUAGE_MODEL_MAP = {
-  en: 'eleven_multilingual_v2',
-  ja: 'eleven_multilingual_v2',
-  es: 'eleven_multilingual_v2',
-  pt: 'eleven_multilingual_v2',
-  zh: 'eleven_multilingual_v2'
-};
+export function hasOpenAITTS(settings) {
+  return Boolean(settings.openaiApiKey?.trim());
+}
 
 export function hasVoiceConfigured(settings) {
-  return Boolean(
-    settings.elevenLabsApiKey?.trim() &&
-    settings.elevenLabsVoiceId?.trim()
-  );
-}
-
-export function hasVoiceSamples(settings) {
-  return (settings.voiceSamples || []).length > 0;
-}
-
-function dataUrlToBlob(dataUrl) {
-  const match = String(dataUrl).match(/^data:([^;]+);base64,(.+)$/);
-  if (!match) throw new Error('Invalid audio data');
-  const binary = atob(match[2]);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return new Blob([bytes], { type: match[1] });
+  return hasOpenAITTS(settings);
 }
 
 function blobToBase64(blob) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = () => {
-      const result = reader.result;
-      const base64 = String(result).split(',')[1];
-      resolve(base64);
-    };
+    reader.onload = () => resolve(String(reader.result).split(',')[1]);
     reader.onerror = reject;
     reader.readAsDataURL(blob);
   });
 }
 
-async function elevenLabsFetch(settings, path, options = {}) {
-  const response = await fetch(`${ELEVENLABS_BASE}${path}`, {
-    ...options,
-    headers: {
-      'xi-api-key': settings.elevenLabsApiKey,
-      ...(options.headers || {})
-    }
-  });
+function resolveVoice(langCode, settings) {
+  const locked = getLockedVoice(settings);
+  if (locked) return locked;
 
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`ElevenLabs: ${errText || response.statusText}`);
+  if (settings.openaiTtsVoice && OPENAI_TTS_VOICES.some((v) => v.id === settings.openaiTtsVoice)) {
+    return settings.openaiTtsVoice;
   }
-  return response;
-}
-
-export async function createVoiceClone() {
-  const settings = await getSettings();
-  const samples = settings.voiceSamples || [];
-
-  if (!settings.elevenLabsApiKey?.trim()) {
-    throw new Error('ElevenLabs API key required. Open popup → My Voice tab.');
-  }
-  if (!samples.length) {
-    throw new Error('Upload or record voice samples first (at least 1 minute total recommended).');
-  }
-
-  const formData = new FormData();
-  formData.append('name', settings.voiceCloneName || 'Aiasistent My Voice');
-  formData.append(
-    'description',
-    'Cloned voice for AI meeting assistant — captures natural intonation and speech patterns.'
-  );
-
-  samples.forEach((sample, index) => {
-    const blob = dataUrlToBlob(sample.dataUrl);
-    const ext = sample.name?.split('.').pop() || 'webm';
-    formData.append('files', blob, sample.name || `sample-${index + 1}.${ext}`);
-  });
-
-  const response = await elevenLabsFetch(settings, '/voices/add', {
-    method: 'POST',
-    body: formData
-  });
-
-  const data = await response.json();
-  if (!data.voice_id) throw new Error('Voice clone failed — no voice ID returned.');
-
-  await saveSettings({
-    elevenLabsVoiceId: data.voice_id,
-    voiceCloneCreatedAt: Date.now()
-  });
-
-  return { voiceId: data.voice_id, name: data.name || settings.voiceCloneName };
+  return OPENAI_TTS_LANG_VOICES[langCode] || 'onyx';
 }
 
 export async function synthesizeSpeech(text, langCode) {
@@ -104,58 +35,67 @@ export async function synthesizeSpeech(text, langCode) {
   const trimmed = String(text || '').trim();
 
   if (!trimmed) throw new Error('No text to speak.');
-  if (!hasVoiceConfigured(settings)) {
-    throw new Error('Voice not configured. Upload samples and create your voice clone in the popup.');
+  if (!hasOpenAITTS(settings)) {
+    throw new Error('OpenAI API key required for speech. Add it in popup → API Settings.');
   }
 
-  const modelId = LANGUAGE_MODEL_MAP[langCode] || 'eleven_multilingual_v2';
-  const voiceSettings = {
-    stability: settings.voiceStability ?? 0.38,
-    similarity_boost: settings.voiceSimilarity ?? 0.88,
-    style: settings.voiceStyle ?? 0.42,
-    use_speaker_boost: true
+  const speakable = await humanizeForTTS(trimmed, langCode, settings);
+  const voice = resolveVoice(langCode, settings);
+  const model = settings.openaiTtsModel === 'tts-1-hd' ? 'tts-1-hd' : 'tts-1';
+  const speed = Number(settings.openaiTtsSpeed);
+  const body = {
+    model,
+    input: speakable,
+    voice,
+    response_format: 'mp3'
   };
+  if (speed >= 0.25 && speed <= 4) body.speed = speed;
 
-  const response = await elevenLabsFetch(
-    settings,
-    `/text-to-speech/${settings.elevenLabsVoiceId}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'audio/mpeg' },
-      body: JSON.stringify({
-        text: trimmed,
-        model_id: modelId,
-        voice_settings: voiceSettings
-      })
-    }
-  );
+  const response = await fetch('https://api.openai.com/v1/audio/speech', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${settings.openaiApiKey}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (!response.ok) {
+    throw new Error(`OpenAI TTS error: ${await response.text()}`);
+  }
 
   const audioBlob = await response.blob();
   const audioBase64 = await blobToBase64(audioBlob);
 
   return {
     audioBase64,
-    mimeType: audioBlob.type || 'audio/mpeg'
+    mimeType: audioBlob.type || 'audio/mpeg',
+    provider: 'openai',
+    voice,
+    model,
+    speakableText: speakable
   };
 }
 
-export async function saveVoiceSample(sample) {
+export async function saveVoiceSettings(updates) {
+  await saveSettings(updates);
   const settings = await getSettings();
-  const samples = [...(settings.voiceSamples || []), sample];
-  await saveSettings({ voiceSamples: samples });
-  return samples;
+  return {
+    voice: settings.openaiTtsVoice,
+    model: settings.openaiTtsModel,
+    ready: hasVoiceConfigured(settings),
+    voiceProfile: settings.voiceProfile || null
+  };
 }
 
-export async function deleteVoiceSample(name) {
-  const settings = await getSettings();
-  const samples = (settings.voiceSamples || []).filter((s) => s.name !== name);
-  await saveSettings({ voiceSamples: samples });
-  return samples;
-}
-
-export async function clearVoiceClone() {
+export async function resetVoiceSettings() {
   await saveSettings({
-    elevenLabsVoiceId: '',
-    voiceCloneCreatedAt: null
+    openaiTtsVoice: 'onyx',
+    openaiTtsModel: 'tts-1',
+    openaiTtsSpeed: 0.95,
+    lockVoiceToProfile: false,
+    voiceProfile: null,
+    voiceSampleDataUrl: ''
   });
+  return { reset: true };
 }

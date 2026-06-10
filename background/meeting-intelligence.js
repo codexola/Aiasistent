@@ -10,6 +10,7 @@ import {
   formatTranscriptText,
   getMeetingArchives
 } from '../shared/storage.js';
+import { callTextAI, hasApiKey } from './ai-service.js';
 
 const LANGUAGE_NAMES = {
   en: 'English',
@@ -19,54 +20,12 @@ const LANGUAGE_NAMES = {
   zh: 'Chinese (Simplified)'
 };
 
-function hasApiKey(settings) {
-  if (settings.apiProvider === 'claude') return Boolean(settings.claudeApiKey?.trim());
-  return Boolean(settings.openaiApiKey?.trim());
-}
-
 async function callAnalysisAI(settings, systemPrompt, userContent) {
   const messages = [
     { role: 'system', content: systemPrompt },
     { role: 'user', content: userContent }
   ];
-
-  if (settings.apiProvider === 'claude') {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': settings.claudeApiKey,
-        'anthropic-version': '2023-06-01',
-        'anthropic-dangerous-direct-browser-access': 'true'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 3000,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userContent }]
-      })
-    });
-    if (!response.ok) throw new Error(`Claude API error: ${await response.text()}`);
-    const data = await response.json();
-    return data.content[0].text;
-  }
-
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${settings.openaiApiKey}`
-    },
-    body: JSON.stringify({
-      model: 'gpt-4o',
-      messages,
-      temperature: 0.4,
-      max_tokens: 3000
-    })
-  });
-  if (!response.ok) throw new Error(`OpenAI API error: ${await response.text()}`);
-  const data = await response.json();
-  return data.choices[0].message.content;
+  return callTextAI(settings, messages, [], { maxTokens: 3000, temperature: 0.4 });
 }
 
 function parseJson(raw) {

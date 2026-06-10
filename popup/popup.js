@@ -1,4 +1,4 @@
-import { MESSAGE_TYPES } from '../shared/constants.js';
+import { MESSAGE_TYPES, OPENAI_TTS_VOICES } from '../shared/constants.js';
 
 async function sendMessage(type, payload) {
   const response = await chrome.runtime.sendMessage({ type, payload });
@@ -17,11 +17,24 @@ document.querySelectorAll('.tab').forEach((tab) => {
   });
 });
 
+function syncApiProviderFields(_provider) {
+  /* OpenAI and Claude key groups always visible — use ON/OFF toggles per provider */
+}
+
 document.getElementById('api-provider').addEventListener('change', (e) => {
-  const isClaude = e.target.value === 'claude';
-  document.getElementById('openai-key-group').style.display = isClaude ? 'none' : 'block';
-  document.getElementById('claude-key-group').style.display = isClaude ? 'block' : 'none';
+  syncApiProviderFields(e.target.value);
 });
+
+async function saveProviderToggles() {
+  await sendMessage(MESSAGE_TYPES.SETTINGS_UPDATED, {
+    openaiTextAiEnabled: document.getElementById('openai-text-enabled').checked,
+    claudeTextAiEnabled: document.getElementById('claude-text-enabled').checked
+  });
+  updateReadiness();
+}
+
+document.getElementById('openai-text-enabled')?.addEventListener('change', saveProviderToggles);
+document.getElementById('claude-text-enabled')?.addEventListener('change', saveProviderToggles);
 
 async function updateReadiness() {
   try {
@@ -29,9 +42,22 @@ async function updateReadiness() {
     const apiEl = document.getElementById('readiness-api');
     const docsEl = document.getElementById('readiness-docs');
 
+    const providerLabel =
+      status.provider === 'gemini'
+        ? 'Gemini'
+        : status.provider === 'claude'
+          ? 'Claude'
+          : status.provider === 'auto'
+            ? 'Auto'
+            : 'OpenAI';
+    const parts = [];
+    if (status.geminiConfigured) parts.push('Gemini');
+    if (status.openaiConfigured && status.openaiTextAiEnabled) parts.push('OpenAI');
+    if (status.claudeConfigured && status.claudeTextAiEnabled) parts.push('Claude');
+    const active = parts.length ? parts.join(' + ') : 'Gemini only';
     apiEl.textContent = status.configured
-      ? `API: ${status.provider === 'claude' ? 'Claude' : 'OpenAI'} configured`
-      : 'API: not configured';
+      ? `API: ${active} (text)`
+      : 'API: not configured — add Gemini key';
     apiEl.className = `readiness-item ${status.configured ? 'ok' : 'warn'}`;
 
     const docCount = status.documentCount || 0;
@@ -43,9 +69,11 @@ async function updateReadiness() {
 
     const voiceEl = document.getElementById('readiness-voice');
     if (voiceEl) {
-      voiceEl.textContent = status.voiceConfigured
-        ? 'Voice: cloned & ready'
-        : 'Voice: not configured (My Voice tab)';
+      if (status.voiceConfigured) {
+        voiceEl.textContent = 'Speech: OpenAI TTS ready';
+      } else {
+        voiceEl.textContent = 'Speech: add OpenAI API key';
+      }
       voiceEl.className = `readiness-item ${status.voiceConfigured ? 'ok' : 'warn'}`;
     }
   } catch {
@@ -56,9 +84,12 @@ async function updateReadiness() {
 async function loadSettings() {
   const settings = await sendMessage(MESSAGE_TYPES.GET_SETTINGS);
 
-  document.getElementById('api-provider').value = settings.apiProvider || 'openai';
+  document.getElementById('api-provider').value = settings.apiProvider || 'gemini';
+  document.getElementById('gemini-key').value = settings.geminiApiKey || '';
   document.getElementById('openai-key').value = settings.openaiApiKey || '';
   document.getElementById('claude-key').value = settings.claudeApiKey || '';
+  document.getElementById('openai-text-enabled').checked = settings.openaiTextAiEnabled !== false;
+  document.getElementById('claude-text-enabled').checked = settings.claudeTextAiEnabled !== false;
   document.getElementById('popup-display-lang').value = settings.displayLanguage || 'en';
   document.getElementById('popup-self-lang').value = settings.selfOutputLanguage || 'en';
   document.getElementById('popup-client-comm-lang').value =
@@ -66,13 +97,29 @@ async function loadSettings() {
   document.getElementById('popup-client-input-lang').value = settings.clientInputLanguage || 'auto';
   document.getElementById('popup-self-input-lang').value = settings.selfInputLanguage || 'auto';
   document.getElementById('popup-use-past-insights').checked = settings.usePastMeetingInsights !== false;
-  document.getElementById('elevenlabs-key').value = settings.elevenLabsApiKey || '';
-  document.getElementById('voice-clone-name').value = settings.voiceCloneName || 'My Meeting Voice';
   document.getElementById('popup-auto-speak').checked = settings.autoSpeakResponses || false;
 
-  const isClaude = settings.apiProvider === 'claude';
-  document.getElementById('openai-key-group').style.display = isClaude ? 'none' : 'block';
-  document.getElementById('claude-key-group').style.display = isClaude ? 'block' : 'none';
+  const voiceSelect = document.getElementById('openai-tts-voice');
+  if (voiceSelect && !voiceSelect.options.length) {
+    voiceSelect.innerHTML = OPENAI_TTS_VOICES.map(
+      (v) => `<option value="${v.id}">${v.label}</option>`
+    ).join('');
+  }
+  if (voiceSelect) voiceSelect.value = settings.openaiTtsVoice || 'onyx';
+  const modelSelect = document.getElementById('openai-tts-model');
+  if (modelSelect) modelSelect.value = settings.openaiTtsModel || 'tts-1-hd';
+  const speedInput = document.getElementById('openai-tts-speed');
+  const speedLabel = document.getElementById('openai-tts-speed-label');
+  if (speedInput) {
+    speedInput.value = settings.openaiTtsSpeed ?? 0.95;
+    if (speedLabel) speedLabel.textContent = `${Number(speedInput.value).toFixed(2)}×`;
+  }
+  const naturalSpeech = document.getElementById('natural-speech');
+  if (naturalSpeech) naturalSpeech.checked = settings.naturalSpeechEnabled !== false;
+  const lockProfile = document.getElementById('lock-voice-profile');
+  if (lockProfile) lockProfile.checked = settings.lockVoiceToProfile || false;
+
+  syncApiProviderFields(settings.apiProvider || 'gemini');
 
   renderPermanentDocList();
   renderDocList(settings.referenceDocuments || []);
@@ -154,12 +201,32 @@ function renderPermanentDocList() {
         <li class="permanent-doc-item">
           <span class="doc-name">${escapeHtml(d.name)}</span>
           <span class="doc-type-badge">${escapeHtml(d.type)}</span>
+          <span class="doc-txt-file" title="Source file">${escapeHtml(d.txtFile || '')}</span>
           <span class="permanent-lock" title="Permanent record">🔒</span>
         </li>`
         )
         .join('');
     })
     .catch(() => {});
+}
+
+async function preloadDocumentsForMeeting() {
+  const btn = document.getElementById('preload-docs-btn');
+  if (!btn) return;
+  const prev = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Loading…';
+  try {
+    const result = await sendMessage(MESSAGE_TYPES.PRELOAD_REFERENCE_DOCUMENTS);
+    btn.textContent = result?.loaded ? `Ready (${result.loaded} files)` : 'Ready';
+  } catch (err) {
+    btn.textContent = err.message || 'Load failed';
+  } finally {
+    setTimeout(() => {
+      btn.disabled = false;
+      btn.textContent = prev;
+    }, 2000);
+  }
 }
 
 function renderDocList(docs) {
@@ -196,8 +263,11 @@ function renderDocList(docs) {
 document.getElementById('save-settings').addEventListener('click', async () => {
   const settings = {
     apiProvider: document.getElementById('api-provider').value,
+    geminiApiKey: document.getElementById('gemini-key').value.trim(),
     openaiApiKey: document.getElementById('openai-key').value.trim(),
     claudeApiKey: document.getElementById('claude-key').value.trim(),
+    openaiTextAiEnabled: document.getElementById('openai-text-enabled').checked,
+    claudeTextAiEnabled: document.getElementById('claude-text-enabled').checked,
     displayLanguage: document.getElementById('popup-display-lang').value,
     selfOutputLanguage: document.getElementById('popup-self-lang').value,
     clientCommunicationLanguage: document.getElementById('popup-client-comm-lang').value,
@@ -410,6 +480,8 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
+document.getElementById('preload-docs-btn')?.addEventListener('click', preloadDocumentsForMeeting);
+
 document.getElementById('reanalyze-images').addEventListener('click', async () => {
   const settings = await sendMessage(MESSAGE_TYPES.GET_SETTINGS);
   const textEl = document.getElementById('image-analysis-text');
@@ -426,35 +498,91 @@ setupImagePasteZone();
 setupVoiceTab();
 loadSettings();
 
-let voiceMediaRecorder = null;
-let voiceRecordChunks = [];
-let voiceRecordStart = null;
-let voiceRecordTimer = null;
+let pendingVoiceSample = null;
+
+function populateVoiceSelect() {
+  const voiceSelect = document.getElementById('openai-tts-voice');
+  if (!voiceSelect || voiceSelect.options.length) return;
+  voiceSelect.innerHTML = OPENAI_TTS_VOICES.map(
+    (v) => `<option value="${v.id}">${v.label}</option>`
+  ).join('');
+}
+
+function updateVoiceLockUI(settings) {
+  const voiceSelect = document.getElementById('openai-tts-voice');
+  const lockProfile = document.getElementById('lock-voice-profile');
+  const locked = lockProfile?.checked || settings?.lockVoiceToProfile;
+  if (voiceSelect) voiceSelect.disabled = Boolean(locked);
+  const hint = document.getElementById('voice-lock-hint');
+  if (hint) {
+    hint.textContent = locked
+      ? `Locked to analyzed voice: ${settings?.openaiTtsVoice || voiceSelect?.value || 'onyx'}`
+      : 'Pick manually or analyze a voice sample to lock.';
+  }
+}
+
+function renderVoiceProfile(profile) {
+  const el = document.getElementById('voice-profile-display');
+  if (!el) return;
+  if (!profile) {
+    el.innerHTML = '<p class="field-hint">No voice profile yet. Upload your sample and click Analyze.</p>';
+    return;
+  }
+  el.innerHTML = `
+    <div class="voice-profile-card">
+      <strong>Your voice profile</strong>
+      <div>Gender: ${escapeHtml(profile.gender || 'male')}</div>
+      <div>Pitch: ${escapeHtml(profile.pitch || '—')} · Pace: ${escapeHtml(profile.pace || '—')}</div>
+      <div>Locked voice: <strong>${escapeHtml(profile.recommendedVoice || 'onyx')}</strong></div>
+      ${profile.transcriptSnippet ? `<div class="field-hint">Heard: "${escapeHtml(profile.transcriptSnippet.slice(0, 100))}..."</div>` : ''}
+      ${profile.notes ? `<div class="field-hint">${escapeHtml(profile.notes)}</div>` : ''}
+    </div>`;
+}
 
 async function saveVoiceSettings() {
-  await sendMessage(MESSAGE_TYPES.SETTINGS_UPDATED, {
-    elevenLabsApiKey: document.getElementById('elevenlabs-key').value.trim(),
-    voiceCloneName: document.getElementById('voice-clone-name').value.trim() || 'My Meeting Voice',
-    autoSpeakResponses: document.getElementById('popup-auto-speak').checked
+  const speed = Number(document.getElementById('openai-tts-speed')?.value || 0.95);
+  await sendMessage(MESSAGE_TYPES.SAVE_VOICE_SETTINGS, {
+    openaiTtsVoice: document.getElementById('openai-tts-voice')?.value || 'onyx',
+    openaiTtsModel: document.getElementById('openai-tts-model')?.value || 'tts-1-hd',
+    openaiTtsSpeed: speed,
+    autoSpeakResponses: document.getElementById('popup-auto-speak')?.checked,
+    naturalSpeechEnabled: document.getElementById('natural-speech')?.checked !== false,
+    lockVoiceToProfile: document.getElementById('lock-voice-profile')?.checked || false
   });
 }
 
 async function loadVoiceTab() {
+  populateVoiceSelect();
   const settings = await sendMessage(MESSAGE_TYPES.GET_SETTINGS);
-  renderVoiceSampleList(settings.voiceSamples || []);
+  const voiceSelect = document.getElementById('openai-tts-voice');
+  if (voiceSelect) voiceSelect.value = settings.openaiTtsVoice || 'onyx';
+  const modelSelect = document.getElementById('openai-tts-model');
+  if (modelSelect) modelSelect.value = settings.openaiTtsModel || 'tts-1-hd';
+  const speedInput = document.getElementById('openai-tts-speed');
+  const speedLabel = document.getElementById('openai-tts-speed-label');
+  if (speedInput) {
+    speedInput.value = settings.openaiTtsSpeed ?? 0.95;
+    if (speedLabel) speedLabel.textContent = `${Number(speedInput.value).toFixed(2)}×`;
+  }
+  const naturalSpeech = document.getElementById('natural-speech');
+  if (naturalSpeech) naturalSpeech.checked = settings.naturalSpeechEnabled !== false;
+  const lockProfile = document.getElementById('lock-voice-profile');
+  if (lockProfile) lockProfile.checked = settings.lockVoiceToProfile || false;
+  renderVoiceProfile(settings.voiceProfile);
+  updateVoiceLockUI(settings);
 
   try {
     const status = await sendMessage(MESSAGE_TYPES.GET_VOICE_STATUS);
     const panel = document.getElementById('voice-status-panel');
     if (panel) {
       if (status.configured) {
-        panel.textContent = `Voice clone ready (${status.sampleCount} sample(s) on file)`;
+        const profileNote = status.voiceProfile
+          ? ` · profile locked (${status.voiceProfile.recommendedVoice})`
+          : '';
+        panel.textContent = `Speech ready — OpenAI ${status.voice} (${status.model})${profileNote}`;
         panel.className = 'readiness-item ok';
-      } else if (status.hasSamples) {
-        panel.textContent = `${status.sampleCount} sample(s) uploaded — click Create Voice Clone`;
-        panel.className = 'readiness-item warn';
       } else {
-        panel.textContent = 'Upload or record voice samples to create your clone';
+        panel.textContent = 'Add OpenAI API key in API Settings for speech';
         panel.className = 'readiness-item warn';
       }
     }
@@ -463,73 +591,79 @@ async function loadVoiceTab() {
   }
 }
 
-function renderVoiceSampleList(samples) {
-  const list = document.getElementById('voice-sample-list');
-  if (!list) return;
-  if (!samples.length) {
-    list.innerHTML = '';
-    return;
-  }
-  list.innerHTML = samples
-    .map(
-      (s) => `
-    <li class="voice-sample-item">
-      <span>${escapeHtml(s.name)}</span>
-      <button type="button" class="voice-sample-delete" data-name="${escapeHtml(s.name)}">×</button>
-    </li>`
-    )
-    .join('');
+function setupVoiceTab() {
+  populateVoiceSelect();
 
-  list.querySelectorAll('.voice-sample-delete').forEach((btn) => {
-    btn.addEventListener('click', async () => {
-      await sendMessage(MESSAGE_TYPES.DELETE_VOICE_SAMPLE, btn.dataset.name);
+  document.getElementById('voice-sample-upload')?.addEventListener('change', async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (file.size > 15 * 1024 * 1024) {
+      alert('Sample too large (max 15 MB).');
+      return;
+    }
+    const dataUrl = await readFileAsDataUrl(file);
+    const base64 = dataUrl.split(',')[1];
+    pendingVoiceSample = {
+      audioBase64: base64,
+      mimeType: file.type || 'audio/mpeg',
+      fileName: file.name
+    };
+    const statusEl = document.getElementById('voice-status');
+    if (statusEl) statusEl.textContent = `Sample loaded: ${file.name} — click Analyze & Lock My Voice`;
+    e.target.value = '';
+  });
+
+  document.getElementById('analyze-voice-sample')?.addEventListener('click', async () => {
+    const statusEl = document.getElementById('voice-status');
+    if (!pendingVoiceSample) {
+      statusEl.textContent = 'Upload a voice sample first.';
+      return;
+    }
+    statusEl.textContent = 'Analyzing your voice sample...';
+    try {
+      const profile = await sendMessage(MESSAGE_TYPES.ANALYZE_VOICE_SAMPLE, pendingVoiceSample);
+      const lockProfile = document.getElementById('lock-voice-profile');
+      if (lockProfile) lockProfile.checked = true;
+      await loadVoiceTab();
+      updateReadiness();
+      statusEl.textContent = `Voice locked: ${profile.recommendedVoice} (${profile.gender}, ${profile.pitch})`;
+    } catch (err) {
+      statusEl.textContent = err.message || 'Analysis failed';
+    }
+  });
+
+  document.getElementById('openai-tts-voice')?.addEventListener('change', saveVoiceSettings);
+  document.getElementById('openai-tts-model')?.addEventListener('change', saveVoiceSettings);
+  document.getElementById('openai-tts-speed')?.addEventListener('input', (e) => {
+    const label = document.getElementById('openai-tts-speed-label');
+    if (label) label.textContent = `${Number(e.target.value).toFixed(2)}×`;
+  });
+  document.getElementById('openai-tts-speed')?.addEventListener('change', saveVoiceSettings);
+  document.getElementById('popup-auto-speak')?.addEventListener('change', saveVoiceSettings);
+  document.getElementById('natural-speech')?.addEventListener('change', saveVoiceSettings);
+  document.getElementById('lock-voice-profile')?.addEventListener('change', async () => {
+    await saveVoiceSettings();
+    const settings = await sendMessage(MESSAGE_TYPES.GET_SETTINGS);
+    updateVoiceLockUI(settings);
+  });
+
+  document.getElementById('reset-voice-settings')?.addEventListener('click', async () => {
+    const statusEl = document.getElementById('voice-status');
+    try {
+      await sendMessage(MESSAGE_TYPES.RESET_VOICE_SETTINGS);
+      pendingVoiceSample = null;
       loadVoiceTab();
       loadSettings();
-    });
-  });
-}
-
-function setupVoiceTab() {
-  document.getElementById('voice-sample-upload')?.addEventListener('change', async (e) => {
-    const files = Array.from(e.target.files || []);
-    for (const file of files) {
-      if (file.size > 10 * 1024 * 1024) {
-        alert(`${file.name} is too large (max 10 MB).`);
-        continue;
-      }
-      const dataUrl = await readFileAsDataUrl(file);
-      await sendMessage(MESSAGE_TYPES.SAVE_VOICE_SAMPLE, {
-        name: file.name,
-        dataUrl,
-        uploadedAt: Date.now()
-      });
-    }
-    e.target.value = '';
-    await saveVoiceSettings();
-    loadVoiceTab();
-    updateReadiness();
-  });
-
-  document.getElementById('voice-record-btn')?.addEventListener('click', startVoiceRecording);
-  document.getElementById('voice-stop-record')?.addEventListener('click', stopVoiceRecording);
-
-  document.getElementById('create-voice-clone')?.addEventListener('click', async () => {
-    const statusEl = document.getElementById('voice-status');
-    statusEl.textContent = 'Creating voice clone — this may take a minute...';
-    try {
-      await saveVoiceSettings();
-      const result = await sendMessage(MESSAGE_TYPES.CREATE_VOICE_CLONE);
-      statusEl.textContent = `Voice clone created: ${result.name || 'Ready'}`;
-      loadVoiceTab();
       updateReadiness();
+      if (statusEl) statusEl.textContent = 'Voice settings reset.';
     } catch (err) {
-      statusEl.textContent = err.message || 'Voice clone failed';
+      if (statusEl) statusEl.textContent = err.message || 'Reset failed';
     }
   });
 
   document.getElementById('test-voice-speak')?.addEventListener('click', async () => {
     const statusEl = document.getElementById('voice-status');
-    statusEl.textContent = 'Generating test speech...';
+    statusEl.textContent = 'Humanizing & generating speech...';
     try {
       await saveVoiceSettings();
       const lang = document.getElementById('popup-client-comm-lang')?.value || 'en';
@@ -546,56 +680,12 @@ function setupVoiceTab() {
       });
       const audio = new Audio(`data:${result.mimeType};base64,${result.audioBase64}`);
       await audio.play();
-      statusEl.textContent = 'Test speech played.';
+      const preview = result.speakableText
+        ? ` · "${result.speakableText.slice(0, 60)}..."`
+        : '';
+      statusEl.textContent = `Played OpenAI ${result.voice || 'TTS'}${preview}`;
     } catch (err) {
       statusEl.textContent = err.message || 'Test failed';
     }
   });
-
-  document.getElementById('popup-auto-speak')?.addEventListener('change', saveVoiceSettings);
-}
-
-async function startVoiceRecording() {
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    voiceRecordChunks = [];
-    voiceMediaRecorder = new MediaRecorder(stream);
-    voiceMediaRecorder.ondataavailable = (e) => {
-      if (e.data.size > 0) voiceRecordChunks.push(e.data);
-    };
-    voiceMediaRecorder.start();
-    voiceRecordStart = Date.now();
-    document.getElementById('voice-recording-panel').hidden = false;
-    document.getElementById('voice-record-btn').disabled = true;
-    voiceRecordTimer = setInterval(() => {
-      const sec = Math.floor((Date.now() - voiceRecordStart) / 1000);
-      const m = Math.floor(sec / 60);
-      const s = sec % 60;
-      document.getElementById('voice-recording-timer').textContent = `${m}:${String(s).padStart(2, '0')}`;
-    }, 500);
-  } catch (err) {
-    alert(err.message || 'Microphone access required');
-  }
-}
-
-async function stopVoiceRecording() {
-  if (!voiceMediaRecorder) return;
-  clearInterval(voiceRecordTimer);
-
-  await new Promise((resolve) => {
-    voiceMediaRecorder.onstop = resolve;
-    voiceMediaRecorder.stop();
-    voiceMediaRecorder.stream.getTracks().forEach((t) => t.stop());
-  });
-
-  const blob = new Blob(voiceRecordChunks, { type: 'audio/webm' });
-  const dataUrl = await readFileAsDataUrl(blob);
-  const name = `recording-${Date.now()}.webm`;
-  await sendMessage(MESSAGE_TYPES.SAVE_VOICE_SAMPLE, { name, dataUrl, uploadedAt: Date.now() });
-
-  document.getElementById('voice-recording-panel').hidden = true;
-  document.getElementById('voice-record-btn').disabled = false;
-  voiceMediaRecorder = null;
-  loadVoiceTab();
-  updateReadiness();
 }

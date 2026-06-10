@@ -1,9 +1,12 @@
 // Run: node scripts/generate-icons.js
 // Generates PNG icons for the Chrome extension using pure Node (no dependencies).
 
-const fs = require('fs');
-const path = require('path');
-const zlib = require('zlib');
+import fs from 'fs';
+import path from 'path';
+import zlib from 'zlib';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 function crc32(buf) {
   let crc = 0xffffffff;
@@ -31,10 +34,10 @@ function createPNG(size) {
       const inCircle = dist < size * 0.42;
       const idx = row + 1 + x * 4;
       if (inCircle) {
-        raw[idx] = 99;      // R
-        raw[idx + 1] = 102; // G
-        raw[idx + 2] = 241; // B
-        raw[idx + 3] = 255; // A
+        raw[idx] = 99;
+        raw[idx + 1] = 102;
+        raw[idx + 2] = 241;
+        raw[idx + 3] = 255;
       } else {
         raw[idx + 3] = 0;
       }
@@ -42,12 +45,15 @@ function createPNG(size) {
   }
 
   const compressed = zlib.deflateSync(raw);
-
   const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(width, 0);
   ihdr.writeUInt32BE(height, 4);
-  ihdr[8] = 8; ihdr[9] = 6; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
 
   function chunk(type, data) {
     const len = Buffer.alloc(4);
@@ -68,7 +74,7 @@ function createPNG(size) {
 }
 
 const iconsDir = path.join(__dirname, '..', 'icons');
-if (!fs.existsSync(iconsDir)) fs.mkdirSync(iconsDir);
+if (!fs.existsSync(iconsDir)) fs.mkdirSync(iconsDir, { recursive: true });
 
 [16, 48, 128].forEach((size) => {
   const file = path.join(iconsDir, `icon${size}.png`);

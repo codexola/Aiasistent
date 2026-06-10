@@ -16,7 +16,7 @@
     <nav class="tabs">
       <button class="tab active" data-tab="documents">Documents</button>
       <button class="tab" data-tab="archives">Archives</button>
-      <button class="tab" data-tab="voice">My Voice</button>
+      <button class="tab" data-tab="voice">Speech</button>
       <button class="tab" data-tab="settings">API Settings</button>
     </nav>
 
@@ -30,7 +30,9 @@
 
       <div class="permanent-docs-panel">
         <div class="permanent-docs-title">📌 Fixed Base (Permanent)</div>
+        <p class="hint permanent-hint">Stored as lightweight <code>data/*.txt</code> files — loaded on demand during meetings.</p>
         <ul class="permanent-doc-list" id="permanent-doc-list"></ul>
+        <button type="button" class="btn-secondary" id="preload-docs-btn">Load documents for meeting</button>
       </div>
 
       <p class="hint" style="margin-top:8px">Optional additional uploads:</p>
@@ -105,38 +107,54 @@
     </section>
 
     <section id="tab-voice" class="tab-panel">
-      <div class="readiness-item" id="voice-status-panel">Voice clone: checking...</div>
-      <p class="hint">Clone your voice from recordings so the client hears <em>you</em> speaking AI-generated responses — including natural intonation and speech patterns from your samples.</p>
+      <div class="readiness-item" id="voice-status-panel">Speech: checking...</div>
+      <p class="hint">Upload <strong>your voice sample</strong> (male speaker). The extension analyzes it and locks the closest OpenAI voice. Speech is humanized with natural pauses and fillers before TTS.</p>
 
-      <div class="form-group">
-        <label>ElevenLabs API Key</label>
-        <input type="password" id="elevenlabs-key" placeholder="Required for voice cloning" />
-        <p class="field-hint"><a href="https://elevenlabs.io" target="_blank" rel="noopener">elevenlabs.io</a> — used to clone your voice and generate speech. OpenAI/Claude handle text; ElevenLabs handles your voice.</p>
-      </div>
-
-      <div class="form-group">
-        <label>Voice Clone Name</label>
-        <input type="text" id="voice-clone-name" placeholder="My Meeting Voice" />
-      </div>
-
-      <div class="voice-actions">
+      <div class="voice-profile-panel">
         <label class="doc-type-btn">
-          <input type="file" id="voice-sample-upload" accept="audio/*" multiple hidden />
-          📁 Upload Samples
+          <input type="file" id="voice-sample-upload" accept="audio/*" hidden />
+          📁 Upload Voice Sample
         </label>
-        <button type="button" id="voice-record-btn" class="doc-type-btn">🎙 Record Sample</button>
-      </div>
-      <p class="field-hint">Upload 1–5 minutes of your voice (clear speech, natural pace). Include natural pauses — the clone learns your intonation and style.</p>
-
-      <div class="voice-recording-panel" id="voice-recording-panel" hidden>
-        <span id="voice-recording-timer">0:00</span>
-        <button type="button" id="voice-stop-record" class="btn-danger">Stop & Save</button>
+        <button type="button" id="analyze-voice-sample" class="btn-primary">Analyze & Lock My Voice</button>
+        <div class="voice-profile-display" id="voice-profile-display"></div>
       </div>
 
-      <ul class="voice-sample-list" id="voice-sample-list"></ul>
+      <div class="form-group">
+        <label>OpenAI TTS Voice</label>
+        <select id="openai-tts-voice"></select>
+        <p class="field-hint" id="voice-lock-hint">Locked to your analyzed voice when profile is active.</p>
+      </div>
 
-      <button type="button" id="create-voice-clone" class="btn-primary">Create / Update Voice Clone</button>
-      <button type="button" id="test-voice-speak" class="btn-secondary">Test Speak</button>
+      <div class="form-group">
+        <label>Speech Quality</label>
+        <select id="openai-tts-model">
+          <option value="tts-1">Standard (faster, tts-1)</option>
+          <option value="tts-1-hd" selected>HD (higher quality, tts-1-hd)</option>
+        </select>
+      </div>
+
+      <div class="form-group">
+        <label>Speech Speed</label>
+        <input type="range" id="openai-tts-speed" min="0.75" max="1.15" step="0.05" value="0.95" />
+        <span id="openai-tts-speed-label">0.95×</span>
+      </div>
+
+      <div class="form-group">
+        <label class="ai-toggle-inline">
+          <input type="checkbox" id="natural-speech" checked />
+          Natural human speech (pauses, fillers, trailing off)
+        </label>
+      </div>
+
+      <div class="form-group">
+        <label class="ai-toggle-inline">
+          <input type="checkbox" id="lock-voice-profile" />
+          Always use analyzed voice profile
+        </label>
+      </div>
+
+      <button type="button" id="test-voice-speak" class="btn-primary">Test Speak</button>
+      <button type="button" id="reset-voice-settings" class="btn-secondary">Reset to Defaults</button>
 
       <div class="form-group" style="margin-top:12px">
         <label class="ai-toggle-inline">
@@ -145,7 +163,7 @@
         </label>
       </div>
 
-      <p class="field-hint">Speech is sent directly into your browser meeting (mic + your cloned voice). No extra software required. Join the meeting <strong>after</strong> opening this page so audio links automatically.</p>
+      <p class="field-hint">Requires an <strong>OpenAI API key</strong> (API Settings). OpenAI cannot clone your exact voice — it picks the closest preset and humanizes delivery.</p>
       <p class="status" id="voice-status"></p>
     </section>
 
@@ -153,19 +171,42 @@
       <div class="form-group">
         <label>AI Provider</label>
         <select id="api-provider">
+          <option value="gemini">Gemini Flash (recommended)</option>
+          <option value="auto">Auto (fallback chain)</option>
           <option value="openai">OpenAI (GPT-4o)</option>
           <option value="claude">Claude (Sonnet)</option>
         </select>
+        <p class="field-hint">When OpenAI/Claude hit limits, <strong>Auto</strong> or <strong>Gemini</strong> is used automatically.</p>
+      </div>
+
+      <div class="form-group" id="gemini-key-group">
+        <label>Gemini API Key</label>
+        <input type="password" id="gemini-key" placeholder="AQ.... or AIza..." />
+        <p class="field-hint">Primary text AI. Model: <code>gemini-flash-latest</code> (fast).</p>
       </div>
 
       <div class="form-group" id="openai-key-group">
-        <label>OpenAI API Key</label>
+        <div class="provider-header">
+          <label>OpenAI API Key</label>
+          <label class="provider-toggle" title="Use OpenAI for text AI (responses, translation)">
+            <input type="checkbox" id="openai-text-enabled" />
+            <span>Text AI ON</span>
+          </label>
+        </div>
         <input type="password" id="openai-key" placeholder="sk-..." />
+        <p class="field-hint">When <strong>OFF</strong>, Gemini handles text automatically. Key still used for TTS/Whisper if set.</p>
       </div>
 
-      <div class="form-group" id="claude-key-group" style="display:none">
-        <label>Claude API Key</label>
+      <div class="form-group" id="claude-key-group">
+        <div class="provider-header">
+          <label>Claude API Key</label>
+          <label class="provider-toggle" title="Use Claude for text AI">
+            <input type="checkbox" id="claude-text-enabled" />
+            <span>Text AI ON</span>
+          </label>
+        </div>
         <input type="password" id="claude-key" placeholder="sk-ant-..." />
+        <p class="field-hint">When <strong>OFF</strong>, Gemini is used instead (recommended if Claude quota is exhausted).</p>
       </div>
 
       <div class="form-group">

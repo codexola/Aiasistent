@@ -1,10 +1,16 @@
 {
   "name": "ai-meeting-assistant",
-  "version": "1.0.0",
+  "version": "1.5.0",
+  "type": "module",
   "description": "Chrome extension AI assistant for remote video meetings",
   "private": true,
   "scripts": {
     "icons": "node scripts/generate-icons.js",
-    "embed-base": "node scripts/embed-default-base.js"
+    "embed-base": "node scripts/embed-default-base.js",
+    "test-apis": "node scripts/test-apis.js",
+    "test-all": "node scripts/test-all.js",
+    "test-gemini": "node scripts/test-gemini.js",
+    "validate": "node scripts/validate-extension.js",
+    "postinstall": "node scripts/generate-icons.js"
   }
 }

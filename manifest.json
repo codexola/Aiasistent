@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Meeting Assist",
-  "version": "1.4.0",
+  "version": "1.7.2",
   "description": "Private meeting assistant for video calls — translation, voice, and notes.",
   "permissions": [
     "storage",
@@ -9,7 +9,8 @@
     "scripting",
     "tabs",
     "tabCapture",
-    "unlimitedStorage"
+    "unlimitedStorage",
+    "alarms"
   ],
   "host_permissions": [
     "https://meet.google.com/*",
@@ -18,7 +19,7 @@
     "https://app.zoom.us/*",
     "https://api.openai.com/*",
     "https://api.anthropic.com/*",
-    "https://api.elevenlabs.io/*"
+    "https://generativelanguage.googleapis.com/*"
   ],
   "background": {
     "service_worker": "background/service-worker.js",

@@ -1,10 +1,16 @@
 // Non-secret default settings — seeded on install.
 // API keys: copy shared/default-config.example.js → shared/default-config.local.js
 export const DEFAULT_API_CONFIG = {
-  apiProvider: 'claude',
+  apiProvider: 'gemini',
   openaiApiKey: '',
   claudeApiKey: '',
-  elevenLabsApiKey: '',
+  geminiApiKey: '',
+  geminiModel: 'gemini-flash-latest',
+  openaiTextAiEnabled: false,
+  claudeTextAiEnabled: false,
+  openaiTtsVoice: 'onyx',
+  openaiTtsModel: 'tts-1-hd',
+  naturalSpeechEnabled: true,
   displayLanguage: 'en',
   selfOutputLanguage: 'en',
   clientCommunicationLanguage: 'ja',

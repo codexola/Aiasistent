@@ -1,0 +1,6 @@
+Place your male voice sample here for automated testing:
+  data/voice-sample.mp3   (or .wav, .webm, .m4a)
+
+Then run:  npm run test-apis
+
+Or upload the same file in the extension popup → Speech tab → Analyze & Lock My Voice.

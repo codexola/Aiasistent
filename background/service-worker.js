@@ -22,7 +22,8 @@ import {
   getEffectiveReferenceDocuments,
   isPermanentDocument,
   ensurePermanentBase,
-  getPermanentDocuments
+  getPermanentDocuments,
+  preloadReferenceDocuments
 } from '../shared/storage.js';
 import { generateResponse, processTranscript, hasApiKey, analyzeProjectImages } from './ai-service.js';
 import {
@@ -30,24 +31,49 @@ import {
   updateLiveParticipantProfiles
 } from './meeting-intelligence.js';
 import {
-  createVoiceClone,
   synthesizeSpeech,
-  saveVoiceSample,
-  deleteVoiceSample,
+  saveVoiceSettings,
   hasVoiceConfigured,
-  hasVoiceSamples,
-  clearVoiceClone
+  hasOpenAITTS,
+  resetVoiceSettings
 } from './voice-service.js';
+import { transcribeAudioBlob, hasTranscriptionConfigured } from './transcribe-service.js';
+import { analyzeVoiceSample } from './voice-profile-service.js';
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  handleMessage(message, sender).then(sendResponse).catch((err) => {
-    sendResponse({ error: err.message });
-  });
+  let responded = false;
+  const safeRespond = (payload) => {
+    if (responded) return;
+    responded = true;
+    try {
+      sendResponse(payload);
+    } catch {
+      /* message port may already be closed */
+    }
+  };
+
+  handleMessage(message, sender)
+    .then((result) => safeRespond(result))
+    .catch((err) => safeRespond({ error: err?.message || 'Background handler failed' }));
+
   return true;
 });
 
+const MEETING_KEEPALIVE_ALARM = 'meeting-keepalive';
+
 async function handleMessage(message, sender) {
   switch (message.type) {
+    case MESSAGE_TYPES.PING:
+      return { ok: true, ts: Date.now() };
+
+    case MESSAGE_TYPES.MEETING_KEEPALIVE_START:
+      await chrome.alarms.create(MEETING_KEEPALIVE_ALARM, { periodInMinutes: 1 });
+      return { ok: true };
+
+    case MESSAGE_TYPES.MEETING_KEEPALIVE_STOP:
+      await chrome.alarms.clear(MEETING_KEEPALIVE_ALARM);
+      return { ok: true };
+
     case MESSAGE_TYPES.GET_SETTINGS:
       await seedInitialSetup();
       return getSettings();
@@ -201,47 +227,76 @@ async function handleMessage(message, sender) {
     case MESSAGE_TYPES.GET_LIVE_PROFILES:
       return getLiveProfiles();
 
-    case MESSAGE_TYPES.SAVE_VOICE_SAMPLE:
-      return saveVoiceSample(message.payload);
-
-    case MESSAGE_TYPES.DELETE_VOICE_SAMPLE:
-      return deleteVoiceSample(message.payload);
-
-    case MESSAGE_TYPES.CREATE_VOICE_CLONE:
-      return createVoiceClone();
+    case MESSAGE_TYPES.SAVE_VOICE_SETTINGS:
+      return saveVoiceSettings(message.payload || {});
 
     case MESSAGE_TYPES.SYNTHESIZE_VOICE:
       return synthesizeSpeech(message.payload.text, message.payload.langCode);
 
-    case MESSAGE_TYPES.CLEAR_VOICE_CLONE:
-      return clearVoiceClone();
+    case MESSAGE_TYPES.RESET_VOICE_SETTINGS:
+      return resetVoiceSettings();
+
+    case MESSAGE_TYPES.ANALYZE_VOICE_SAMPLE: {
+      const { audioBase64, mimeType, fileName } = message.payload;
+      return analyzeVoiceSample(audioBase64, mimeType, fileName);
+    }
 
     case MESSAGE_TYPES.GET_PERMANENT_DOCUMENTS:
       return getPermanentDocuments();
 
+    case MESSAGE_TYPES.PRELOAD_REFERENCE_DOCUMENTS:
+      return preloadReferenceDocuments();
+
+    case MESSAGE_TYPES.TRANSCRIBE_AUDIO: {
+      const { audioBase64, mimeType, langHint } = message.payload;
+      const binary = atob(audioBase64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const blob = new Blob([bytes], { type: mimeType || 'audio/webm' });
+      const text = await transcribeAudioBlob(blob, langHint, mimeType || 'audio/webm');
+      return { text };
+    }
+
     case MESSAGE_TYPES.GET_VOICE_STATUS: {
+      await seedInitialSetup();
       const settings = await getSettings();
+      const openaiTts = hasOpenAITTS(settings);
       return {
         configured: hasVoiceConfigured(settings),
-        hasSamples: hasVoiceSamples(settings),
-        sampleCount: (settings.voiceSamples || []).length,
-        voiceId: settings.elevenLabsVoiceId || null
+        hasOpenAITTS: openaiTts,
+        ttsProvider: openaiTts ? 'openai' : null,
+        hasTranscription: hasTranscriptionConfigured(settings),
+        voice: settings.openaiTtsVoice || 'onyx',
+        model: settings.openaiTtsModel || 'tts-1',
+        voiceProfile: settings.voiceProfile || null,
+        lockVoiceToProfile: settings.lockVoiceToProfile || false,
+        naturalSpeechEnabled: settings.naturalSpeechEnabled !== false
       };
     }
 
     case MESSAGE_TYPES.GET_API_STATUS: {
+      await seedInitialSetup();
       const settings = await getSettings();
       const archives = await getMeetingArchives();
-      const permanent = await getEffectiveReferenceDocuments();
+      const permanent = await getPermanentDocuments();
       const userCount = (settings.referenceDocuments || []).length;
       return {
         configured: hasApiKey(settings),
+        textAiConfigured: hasApiKey(settings),
+        openaiConfigured: Boolean(settings.openaiApiKey?.trim()),
+        claudeConfigured: Boolean(settings.claudeApiKey?.trim()),
+        geminiConfigured: Boolean(settings.geminiApiKey?.trim()),
+        openaiTextAiEnabled: settings.openaiTextAiEnabled !== false,
+        claudeTextAiEnabled: settings.claudeTextAiEnabled !== false,
+        activeTextProvider: settings.apiProvider || 'gemini',
         provider: settings.apiProvider,
-        documentCount: permanent.length,
+        documentCount: permanent.length + userCount,
         userDocumentCount: userCount,
-        permanentDocumentCount: permanent.length - userCount,
+        permanentDocumentCount: permanent.length,
         archiveCount: archives.length,
-        voiceConfigured: hasVoiceConfigured(settings)
+        voiceConfigured: hasVoiceConfigured(settings),
+        transcriptionConfigured: hasTranscriptionConfigured(settings),
+        ttsProvider: hasOpenAITTS(settings) ? 'openai' : null
       };
     }
 
@@ -259,4 +314,11 @@ chrome.runtime.onInstalled.addListener(async () => {
 
 chrome.runtime.onStartup.addListener(async () => {
   await ensurePermanentBase();
+  await seedInitialSetup();
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === MEETING_KEEPALIVE_ALARM) {
+    chrome.storage.session.set({ meetingKeepAlive: Date.now() }).catch(() => {});
+  }
 });

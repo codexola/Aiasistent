@@ -10,10 +10,27 @@ import {
   getLiveProfiles,
   getEffectiveReferenceDocuments
 } from '../shared/storage.js';
+import { CLAUDE_MODEL } from '../shared/constants.js';
+import {
+  PERMANENT_DOC_IDS,
+  buildCompactDocContext,
+  detectLanguageLocal,
+  formatApiError,
+  shrinkSystemPrompt,
+  truncateText,
+  withTimeout
+} from '../shared/prompt-utils.js';
 import {
   getPastMeetingContext,
   buildLiveProfilesContext
 } from './meeting-intelligence.js';
+import { callGemini, hasGeminiKey } from './gemini-service.js';
+
+export { hasGeminiKey };
+
+let lastGenerateKey = '';
+let lastGenerateAt = 0;
+let lastGenerateResult = null;
 
 const LANGUAGE_NAMES = {
   en: 'English',
@@ -34,13 +51,18 @@ const PRONUNCIATION_RULES = `English-friendly pronunciation guide rules:
 6. Keep on one or two lines; no explanations.`;
 
 const SPOKEN_VERBAL_STYLE = `Spoken verbal delivery rules (CRITICAL):
-1. Write for SPEECH, not text — short sentences, natural rhythm, conversational flow.
-2. Use native ${'{targetLang}'} phrasing a local professional would actually say on a video call.
-3. Address the customer's specific requirement directly; do not be vague or generic.
-4. Avoid bullet points, markdown, parentheses, or written-only formalities.
-5. Sound confident, warm, and human — as if speaking face-to-face.
-6. Maximum 2–4 sentences unless a detailed answer is clearly required.
-7. Never use language that sounds like an email or document.`;
+1. Write for LIVE SPEECH on a video call — not text, not email, not a script being read aloud.
+2. Sound like a real human thinking while talking: natural rhythm, slight imperfections welcome.
+3. Use conversational ${'{targetLang}'} a local professional would actually say.
+4. Include human speech patterns where natural:
+   - Brief fillers: "um", "uh", "well", "so", "you know"
+   - Pauses marked with "..." or em dashes when reflecting
+   - Light repetition when reconsidering: "I— I think", "we could, we could maybe"
+   - Trailing off at the start or end of a sentence sometimes, then completing the thought
+5. Address the customer's specific requirement directly.
+6. NO bullet points, markdown, parentheses, or written-only formalities.
+7. Maximum 2–5 short spoken sentences unless more detail is clearly needed.
+8. Never sound like an AI reading text continuously.`;
 
 function parseJsonFromAI(raw) {
   const jsonMatch = raw.match(/\{[\s\S]*\}/);
@@ -52,8 +74,39 @@ function normalizePronunciation(value) {
   return String(value).trim() || null;
 }
 
-async function buildSystemPrompt(settings, bidDoc) {
-  const docs = await getEffectiveReferenceDocuments();
+async function buildSystemPrompt(settings, bidDoc, options = {}) {
+  const { quick = false } = options;
+  const displayLang = LANGUAGE_NAMES[settings.displayLanguage] || 'English';
+  const clientCommName =
+    LANGUAGE_NAMES[settings.clientCommunicationLanguage || settings.clientLanguage || 'en'] ||
+    'English';
+
+  const docs = await getEffectiveReferenceDocuments({
+    loadContent: true,
+    docIds: quick ? PERMANENT_DOC_IDS : null
+  });
+
+  if (quick) {
+    const docContext = buildCompactDocContext(docs);
+    const bidSource = truncateText(
+      bidDoc.currentContent || bidDoc.sourceContent || bidDoc.modifications?.[0]?.text || '',
+      1200
+    );
+
+    return shrinkSystemPrompt(`You are a live meeting assistant for a freelancer on a client video call.
+Worker reads ${displayLang}. Speak to the client in ${clientCommName}.
+
+Reference data (use accurately — never invent facts):
+${docContext || 'No reference files loaded.'}
+
+Bid notes: ${bidSource || 'None'}
+
+Rules:
+1. suggestedResponse = natural spoken ${clientCommName}, 2–4 sentences, answers the client's latest question.
+2. Use reference data for facts about the worker's background and experience.
+3. Be concise — this is a real-time call.`);
+  }
+
   const imageAnalysis = await getImageAnalysis();
   const participants = settings.participants || (await getParticipants());
   const liveProfiles = await getLiveProfiles();
@@ -62,55 +115,38 @@ async function buildSystemPrompt(settings, bidDoc) {
 
   const docContext = docs
     .filter((d) => !d.imageData)
-    .map((d) => `--- ${d.name} (${d.type}) ---\n${d.content}`)
+    .map((d) => `--- ${d.name} (${d.type}) ---\n${truncateText(d.content, 4000)}`)
     .join('\n\n');
 
   const imageContext = imageAnalysis?.summary
-    ? `\n\nProject image analysis (from uploaded mockups/screenshots):\n${imageAnalysis.summary}`
+    ? `\n\nProject image analysis:\n${truncateText(imageAnalysis.summary, 2000)}`
     : '';
 
-  const bidSource =
-    bidDoc.currentContent || bidDoc.sourceContent || bidDoc.modifications?.[0]?.text || '';
-
-  const displayLang = LANGUAGE_NAMES[settings.displayLanguage] || 'English';
-  const clientCommName =
-    LANGUAGE_NAMES[settings.clientCommunicationLanguage || settings.clientLanguage || 'en'] ||
-    'English';
+  const bidSource = truncateText(
+    bidDoc.currentContent || bidDoc.sourceContent || bidDoc.modifications?.[0]?.text || '',
+    3000
+  );
 
   const participantList = participants
     .map((p) => `- ${p.name} (id: ${p.id}, role: ${p.role})`)
     .join('\n');
 
-  return `You are an AI meeting assistant helping a remote worker during a live client video call for freelance/contract bidding.
+  return shrinkSystemPrompt(`You are an AI meeting assistant helping a remote worker during a live client video call.
 
-The worker reads ${displayLang}, speaks English internally, and delivers verbal responses to clients in ${clientCommName}.
-Meetings may include MULTIPLE participants — track each person's intent separately.
+Worker reads ${displayLang}, delivers verbal responses in ${clientCommName}.
 
-Meeting participants:
+Participants:
 ${participantList || '- Client (client)\n- You (self)'}${liveContext}${pastContext}
 
 Reference materials:
 ${docContext || 'No documents uploaded yet.'}${imageContext}
 
-Current bid document:
-${bidSource || 'No bid document uploaded.'}
-
-Tracked bid state:
-${JSON.stringify({ tasks: bidDoc.tasks, modifications: bidDoc.modifications }, null, 2)}
-
-Bidding workflow:
-1. Analyze uploaded project images for scope, UI requirements, and deliverables.
-2. When any client-side participant describes new work, summarize in taskDetails (${displayLang}).
-3. Track bid changes in bidModifications and updatedBidDocument.
-4. Generate suggestedResponse in ${clientCommName} — spoken style, addressing the specific person's inquiry with complete accuracy.
+Current bid: ${bidSource || 'None'}
 
 Rules:
-1. suggestedResponse MUST be in ${clientCommName}, native spoken style, ready to read aloud verbatim.
-2. Tailor the response to the specific participant who spoke and their stated intent/requirements.
-3. Use reference materials and past meeting insights — never fabricate unsupported claims.
-4. For non-English client communication language, populate taskDetails in ${displayLang}.
-5. Keep responses concise, natural, and verbally deliverable in a live call.
-6. Grasp each participant's intent from conversation history and live profiles.`;
+1. suggestedResponse in ${clientCommName}, spoken style, ready to read aloud.
+2. Use reference materials — never fabricate unsupported claims.
+3. Keep responses concise and natural.`, 12000);
 }
 
 function getImageDocuments(docs) {
@@ -146,7 +182,8 @@ function toClaudeContent(content, imageDocs) {
   return blocks;
 }
 
-async function callOpenAI(settings, messages, imageDocs = []) {
+async function callOpenAI(settings, messages, imageDocs = [], options = {}) {
+  const maxTokens = options.maxTokens || 2000;
   const response = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -154,7 +191,7 @@ async function callOpenAI(settings, messages, imageDocs = []) {
       Authorization: `Bearer ${settings.openaiApiKey}`
     },
     body: JSON.stringify({
-      model: 'gpt-4o',
+      model: options.model || 'gpt-4o-mini',
       messages: messages.map((message, index) => {
         const isLastUser = message.role === 'user' && index === messages.length - 1;
         return {
@@ -164,23 +201,24 @@ async function callOpenAI(settings, messages, imageDocs = []) {
             : message.content
         };
       }),
-      temperature: 0.7,
-      max_tokens: 2000
+      temperature: options.temperature ?? 0.65,
+      max_tokens: maxTokens
     })
   });
 
   if (!response.ok) {
     const err = await response.text();
-    throw new Error(`OpenAI API error: ${err}`);
+    throw new Error(formatApiError(`OpenAI API error: ${err}`));
   }
 
   const data = await response.json();
   return data.choices[0].message.content;
 }
 
-async function callClaude(settings, messages, imageDocs = []) {
+async function callClaude(settings, messages, imageDocs = [], options = {}) {
   const systemMsg = messages.find((m) => m.role === 'system');
   const chatMessages = messages.filter((m) => m.role !== 'system');
+  const maxTokens = options.maxTokens || 2000;
 
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -191,8 +229,8 @@ async function callClaude(settings, messages, imageDocs = []) {
       'anthropic-dangerous-direct-browser-access': 'true'
     },
     body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 2000,
+      model: CLAUDE_MODEL,
+      max_tokens: maxTokens,
       system: systemMsg?.content || '',
       messages: chatMessages.map((m, index) => ({
         role: m.role === 'assistant' ? 'assistant' : 'user',
@@ -206,24 +244,137 @@ async function callClaude(settings, messages, imageDocs = []) {
 
   if (!response.ok) {
     const err = await response.text();
-    throw new Error(`Claude API error: ${err}`);
+    throw new Error(formatApiError(`Claude API error: ${err}`));
   }
 
   const data = await response.json();
   return data.content[0].text;
 }
 
-export function hasApiKey(settings) {
-  if (settings.apiProvider === 'claude') return Boolean(settings.claudeApiKey?.trim());
+export function hasOpenAIKey(settings) {
   return Boolean(settings.openaiApiKey?.trim());
 }
 
-async function callAI(settings, messages, imageDocs = []) {
-  if (!hasApiKey(settings)) {
-    throw new Error('API key not configured. Open the extension popup → API Settings.');
+export function hasClaudeKey(settings) {
+  return Boolean(settings.claudeApiKey?.trim());
+}
+
+export function hasTextAiKey(settings) {
+  return hasGeminiKey(settings) || hasOpenAIKey(settings) || hasClaudeKey(settings);
+}
+
+function isTextProviderEnabled(settings, provider) {
+  if (provider === 'gemini') return true;
+  if (provider === 'openai') return settings.openaiTextAiEnabled !== false;
+  if (provider === 'claude') return settings.claudeTextAiEnabled !== false;
+  return false;
+}
+
+function hasProviderKey(settings, provider) {
+  if (!isTextProviderEnabled(settings, provider)) return false;
+  if (provider === 'gemini') return hasGeminiKey(settings);
+  if (provider === 'claude') return hasClaudeKey(settings);
+  if (provider === 'openai') return hasOpenAIKey(settings);
+  return false;
+}
+
+export function hasApiKey(settings) {
+  return getProviderOrder(settings).length > 0;
+}
+
+function getProviderOrder(settings) {
+  const primary = settings.apiProvider || 'gemini';
+  const order = [];
+  const add = (p) => {
+    if (hasProviderKey(settings, p) && !order.includes(p)) order.push(p);
+  };
+
+  const openaiOn = isTextProviderEnabled(settings, 'openai') && hasOpenAIKey(settings);
+  const claudeOn = isTextProviderEnabled(settings, 'claude') && hasClaudeKey(settings);
+
+  if (!openaiOn && !claudeOn) {
+    add('gemini');
+    return order;
   }
-  if (settings.apiProvider === 'claude') return callClaude(settings, messages, imageDocs);
-  return callOpenAI(settings, messages, imageDocs);
+
+  if (primary !== 'auto' && primary !== 'gemini') add(primary);
+  add('gemini');
+  if (openaiOn) add('openai');
+  if (claudeOn) add('claude');
+  return order;
+}
+
+function isRetryableAiError(err) {
+  const msg = String(err?.message || err).toLowerCase();
+  return (
+    msg.includes('rate limit') ||
+    msg.includes('rate_limit') ||
+    msg.includes('quota') ||
+    msg.includes('exceeded') ||
+    msg.includes('503') ||
+    msg.includes('high demand') ||
+    msg.includes('overloaded') ||
+    msg.includes('blocked') ||
+    msg.includes('invalid x-api-key') ||
+    msg.includes('incorrect api key') ||
+    msg.includes('401') ||
+    msg.includes('403')
+  );
+}
+
+async function callProvider(settings, provider, messages, imageDocs, options) {
+  if (provider === 'gemini') return callGemini(settings, messages, imageDocs, options);
+  if (provider === 'claude') return callClaude(settings, messages, imageDocs, options);
+  return callOpenAI(settings, messages, imageDocs, options);
+}
+
+async function callAI(settings, messages, imageDocs = [], options = {}) {
+  const providers = getProviderOrder(settings);
+  if (!providers.length) {
+    throw new Error('No AI API key configured. Open extension popup → API Settings.');
+  }
+  return callProvider(settings, providers[0], messages, imageDocs, options);
+}
+
+async function callAIWithRetry(settings, messages, imageDocs = [], options = {}) {
+  const quickOpts = { maxTokens: options.maxTokens || 1024, temperature: 0.65, json: options.json };
+  const providers = getProviderOrder(settings);
+  if (!providers.length) {
+    throw new Error('No AI API key configured. Open extension popup → API Settings.');
+  }
+
+  let lastError = null;
+  for (const provider of providers) {
+    try {
+      return await callProvider(settings, provider, messages, imageDocs, quickOpts);
+    } catch (err) {
+      lastError = err;
+      if (!isRetryableAiError(err)) throw err;
+    }
+  }
+
+  await new Promise((r) => setTimeout(r, 2000));
+  const shrunk = messages.map((m) =>
+    m.role === 'system' ? { ...m, content: shrinkSystemPrompt(m.content, 3500) } : m
+  );
+
+  for (const provider of providers) {
+    try {
+      return await callProvider(settings, provider, shrunk, [], {
+        ...quickOpts,
+        maxTokens: 800,
+        temperature: 0.6
+      });
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  throw lastError || new Error('All AI providers failed. Check API keys and quotas.');
+}
+
+export async function callTextAI(settings, messages, imageDocs = [], options = {}) {
+  return callAIWithRetry(settings, messages, imageDocs, options);
 }
 
 export async function detectLanguage(text, settings) {
@@ -406,8 +557,6 @@ export async function generateResponse(payload) {
   const settings = await getSettings();
   const conversation = await getConversation();
   const bidDoc = await getBidDocument();
-  const imageDocs = getImageDocuments(await getEffectiveReferenceDocuments());
-  const participants = settings.participants || (await getParticipants());
 
   const latestClientMessage =
     typeof payload === 'string' ? payload : payload?.message || payload?.text;
@@ -422,50 +571,58 @@ export async function generateResponse(payload) {
   const speakerName =
     speakingParticipant?.participantName || speakingParticipant?.name || 'Client';
 
+  const cacheKey = `${conversation.length}:${latestClientMessage?.slice(0, 120)}`;
+  if (
+    latestClientMessage &&
+    cacheKey === lastGenerateKey &&
+    Date.now() - lastGenerateAt < 8000 &&
+    lastGenerateResult
+  ) {
+    return lastGenerateResult;
+  }
+
   const history = conversation
-    .slice(-30)
+    .slice(-10)
     .map((e) => {
       const name = e.participantName || (e.speaker === 'self' ? 'You' : 'Client');
-      const role = e.participantRole || e.speaker || 'client';
-      return `[${name} (${role})]: ${e.translatedText || e.originalText}`;
+      return `${name}: ${truncateText(e.translatedText || e.originalText, 400)}`;
     })
     .join('\n');
 
-  const imageNote = imageDocs.length
-    ? `\n\n${imageDocs.length} project image(s) are attached. Analyze them for requirements, UI details, and bid changes.`
-    : '';
-
   const clientCommLang = settings.clientCommunicationLanguage || settings.clientLanguage || 'en';
   const clientCommName = LANGUAGE_NAMES[clientCommLang] || clientCommLang;
-  const spokenRules = SPOKEN_VERBAL_STYLE.replace(/\{targetLang\}/g, clientCommName);
+  const displayLang = LANGUAGE_NAMES[settings.displayLanguage] || 'English';
 
   const messages = [
-    { role: 'system', content: await buildSystemPrompt(settings, bidDoc) },
+    { role: 'system', content: await buildSystemPrompt(settings, bidDoc, { quick: true }) },
     {
       role: 'user',
-      content: `Full conversation (real-time, multiple participants possible):
-${history}
+      content: `Recent conversation:
+${history || '(no prior messages)'}
 
-Latest message from ${speakerName}: "${latestClientMessage}"${imageNote}
+Client (${speakerName}) just said: "${truncateText(latestClientMessage, 600)}"
 
-${spokenRules}
+Assess the situation:
+1. Has the client FINISHED their question or explanation? (not mid-sentence)
+2. Are they asking for an answer, still explaining, or making a statement?
+3. If finished and asking — answer directly using reference data.
+4. If still explaining — give a brief spoken acknowledgment (1 sentence) that shows you follow, then invite them to continue.
 
-Respond in JSON only:
+Reply in JSON only:
 {
-  "clientLanguage": "detected language code of the speaker (en, ja, es, pt, zh)",
-  "respondingTo": "${speakerName}",
-  "suggestedResponse": "native ${clientCommName} spoken response — verbal, direct, addresses their requirement with complete accuracy, ready to read aloud",
-  "pronunciationGuide": "English-friendly pronunciation for suggestedResponse (null if ${clientCommName} is English)",
-  "taskDetails": "new task details in ${LANGUAGE_NAMES[settings.displayLanguage] || 'English'} (null if not applicable)",
-  "bidModifications": "bid changes requested (null if none)",
-  "updatedBidDocument": "full revised bid text (null if unchanged)",
-  "participantIntent": "brief note on this speaker's intent and how the response addresses it",
-  "reasoning": "brief internal reasoning"
+  "clientLanguage": "en|ja|es|pt|zh",
+  "clientFinishedSpeaking": true,
+  "suggestedResponse": "spoken ${clientCommName} answer — 2-4 natural sentences addressing their question, using reference data",
+  "pronunciationGuide": "English phonetic guide for suggestedResponse or null if English",
+  "responseTranslation": "${displayLang} meaning of suggestedResponse or null if same language",
+  "taskDetails": "brief task note in ${displayLang} or null",
+  "bidModifications": "null",
+  "participantIntent": "one short line"
 }`
     }
   ];
 
-  const raw = await callAI(settings, messages, imageDocs);
+  const raw = await callAIWithRetry(settings, messages, [], { maxTokens: 1024 });
 
   try {
     const jsonMatch = raw.match(/\{[\s\S]*\}/);
@@ -482,38 +639,20 @@ Respond in JSON only:
     }
 
     parsed.pronunciationGuide = normalizePronunciation(parsed.pronunciationGuide);
-    if (
-      parsed.suggestedResponse &&
-      !parsed.pronunciationGuide &&
-      clientCommLang !== 'en'
-    ) {
-      parsed.pronunciationGuide = await generatePronunciationGuide(
-        parsed.suggestedResponse,
-        clientCommLang,
-        settings
-      );
+    if (parsed.responseTranslation === 'null' || parsed.responseTranslation === '') {
+      parsed.responseTranslation = null;
     }
 
-    if (
-      parsed.suggestedResponse &&
-      settings.displayLanguage &&
-      clientCommLang !== settings.displayLanguage
-    ) {
-      try {
-        parsed.responseTranslation = await translateText(
-          parsed.suggestedResponse,
-          settings.displayLanguage,
-          settings,
-          clientCommLang
-        );
-      } catch {
-        /* optional helper translation */
-      }
-    }
-
+    lastGenerateKey = cacheKey;
+    lastGenerateAt = Date.now();
+    lastGenerateResult = parsed;
     return parsed;
   } catch {
-    return { suggestedResponse: raw };
+    const fallback = { suggestedResponse: raw.trim() };
+    lastGenerateKey = cacheKey;
+    lastGenerateAt = Date.now();
+    lastGenerateResult = fallback;
+    return fallback;
   }
 }
 
@@ -550,11 +689,23 @@ export async function processTranscript(entry) {
   if (!detectedLanguage || detectedLanguage === 'auto') {
     if (configuredInputLang && configuredInputLang !== 'auto') {
       detectedLanguage = configuredInputLang;
+    } else if (!isSelf) {
+      detectedLanguage = detectLanguageLocal(entry.originalText);
+      if (detectedLanguage === 'unknown' && settings.clientLanguage) {
+        detectedLanguage = settings.clientLanguage;
+      }
+      if (detectedLanguage === 'unknown') {
+        detectedLanguage = 'en';
+      }
     } else {
       try {
-        detectedLanguage = await detectLanguage(entry.originalText, settings);
+        detectedLanguage = await withTimeout(
+          detectLanguage(entry.originalText, settings),
+          8000,
+          () => detectLanguageLocal(entry.originalText) || 'en'
+        );
       } catch (err) {
-        detectedLanguage = 'unknown';
+        detectedLanguage = detectLanguageLocal(entry.originalText) || 'en';
         translationError = err.message;
       }
     }
@@ -567,16 +718,22 @@ export async function processTranscript(entry) {
     }
   }
 
-  if (settings.autoTranslate && detectedLanguage !== targetLang) {
+  const shouldTranslate =
+    settings.autoTranslate &&
+    detectedLanguage !== targetLang &&
+    detectedLanguage !== 'unknown' &&
+    entry.originalText.trim().length >= 4;
+
+  if (shouldTranslate) {
     try {
-      translatedText = await translateText(
-        entry.originalText,
-        targetLang,
-        settings,
-        detectedLanguage
+      translatedText = await withTimeout(
+        translateText(entry.originalText, targetLang, settings, detectedLanguage),
+        isSelf ? 15000 : 10000,
+        () => entry.originalText
       );
     } catch (err) {
       console.error('Translation failed:', err);
+      translatedText = entry.originalText;
       translationError = err.message;
     }
   }
@@ -588,10 +745,13 @@ export async function processTranscript(entry) {
 
   if (isSelf) {
     try {
-      const prepared = await prepareMessageForClient(
-        entry.originalText,
-        settings,
-        detectedLanguage
+      const prepared = await withTimeout(
+        prepareMessageForClient(entry.originalText, settings, detectedLanguage),
+        18000,
+        () => ({
+          clientFacingText: entry.originalText,
+          clientFacingPronunciation: null
+        })
       );
       clientFacingText = prepared.clientFacingText;
       clientFacingPronunciation = prepared.clientFacingPronunciation;
