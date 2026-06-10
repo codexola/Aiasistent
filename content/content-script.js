@@ -37,6 +37,9 @@
   let bidDocument = { tasks: [], modifications: [] };
   let responseDebounceTimer = null;
   let lastSuggestedResponse = '';
+  let currentSpeakAudio = null;
+  let isSpeaking = false;
+  let audioBridgeReady = false;
 
   async function sendMessage(type, payload) {
     const response = await chrome.runtime.sendMessage({ type, payload });
@@ -56,15 +59,19 @@
       <div id="ai-meeting-sidebar">
         <div class="ai-sidebar-header">
           <div style="display:flex;align-items:center;">
-            <span class="ai-logo">🤖</span>
-            <h2>AI Meeting Assistant</h2>
+            <span class="ai-logo">◆</span>
+            <h2>Assist</h2>
           </div>
           <button class="ai-toggle-btn" id="ai-collapse-btn" title="Collapse">◀</button>
         </div>
 
         <div class="ai-sidebar-body">
-          <div class="ai-warning-banner" id="ai-api-warning" hidden>
-            ⚠️ API key not set. Open the extension popup → API Settings to enable translation and AI responses.
+          <div class="ai-warning-banner ai-stealth-hide" id="ai-voice-warning" hidden>
+            Voice not configured — open extension popup → My Voice tab.
+          </div>
+
+          <div class="ai-warning-banner ai-stealth-hide" id="ai-api-warning" hidden>
+            API key not set — open extension popup → API Settings.
           </div>
 
           <div class="ai-section">
@@ -126,7 +133,7 @@
           <div class="ai-section">
             <div class="ai-section-title">Controls</div>
             <div class="ai-toggle-row">
-              <span>AI Response Modal</span>
+              <span>Response panel</span>
               <label class="ai-switch">
                 <input type="checkbox" id="ai-responses-toggle" />
                 <span class="ai-switch-slider"></span>
@@ -139,6 +146,14 @@
                 <span class="ai-switch-slider"></span>
               </label>
             </div>
+            <div class="ai-toggle-row">
+              <span>Auto-voice to meeting</span>
+              <label class="ai-switch">
+                <input type="checkbox" id="ai-auto-speak" checked />
+                <span class="ai-switch-slider"></span>
+              </label>
+            </div>
+            <p class="ai-hint ai-stealth-hide">Your voice is sent directly into the call — mic + speech, no extra software.</p>
           </div>
 
           <div class="ai-section" style="padding-bottom:4px;">
@@ -147,7 +162,7 @@
           <div class="ai-transcript" id="ai-transcript"></div>
         </div>
 
-        <button class="ai-response-btn" id="ai-generate-btn">✨ Generate Response</button>
+        <button class="ai-response-btn" id="ai-generate-btn">Suggest Response</button>
         <button class="ai-export-btn" id="ai-export-btn" title="Download transcript">⬇ Export Transcript</button>
 
         <div class="ai-status-bar">
@@ -159,9 +174,10 @@
       <div id="ai-meeting-modal-backdrop"></div>
       <div id="ai-meeting-modal">
         <div class="ai-modal-header">
-          <h3>AI Response Assistant</h3>
+          <h3>Response</h3>
           <div class="ai-modal-actions">
-            <button class="ai-modal-copy" id="ai-modal-copy" title="Copy response">📋 Copy</button>
+            <button class="ai-modal-speak" id="ai-modal-speak" title="Send voice to meeting">🔊</button>
+            <button class="ai-modal-copy" id="ai-modal-copy" title="Copy">📋</button>
             <button class="ai-modal-close" id="ai-modal-close">×</button>
           </div>
         </div>
@@ -174,8 +190,8 @@
           <div class="bid-content" id="ai-modal-bid">No client modifications yet.</div>
         </div>
         <div class="ai-modal-response">
-          <h4>💬 Suggested Response</h4>
-          <div class="response-text" id="ai-modal-response">Click "Generate Response" to get AI suggestions.</div>
+          <h4>💬 Response</h4>
+          <div class="response-text" id="ai-modal-response">Use "Suggest Response" when ready.</div>
         </div>
       </div>
     `;
@@ -188,12 +204,87 @@
 
   async function bootstrapSidebar() {
     await loadSettings();
+    initAudioBridge();
     checkApiStatus();
     await initMeetingSession();
     loadConversationHistory();
     loadBidDocument();
     ensureImageAnalysis();
     startSpeechRecognition();
+    applyStealthLayout();
+    autoConfigureVoice();
+  }
+
+  function initAudioBridge() {
+    const markReady = () => {
+      audioBridgeReady = true;
+      syncAudioBridgeConfig();
+      setStatus('Audio linked to meeting', true);
+    };
+
+    window.addEventListener('ai-audio-bridge-ready', markReady);
+    window.addEventListener('ai-meeting-tts-done', (e) => {
+      if (!e.detail?.ok && e.detail?.error) {
+        setStatus(e.detail.error, false);
+      }
+    });
+
+    if (window.__aiMeetingAudioBridge) markReady();
+  }
+
+  function syncAudioBridgeConfig() {
+    window.dispatchEvent(
+      new CustomEvent('ai-meeting-config', {
+        detail: { muteMicDuringSpeak: settings.muteMicDuringSpeak !== false }
+      })
+    );
+  }
+
+  function applyStealthLayout() {
+    if (settings.stealthMode === false) return;
+    const sidebar = document.getElementById('ai-meeting-sidebar');
+    if (!sidebar) return;
+    sidebar.classList.add('collapsed');
+    applyPageLayout(true);
+    document.getElementById('ai-collapse-btn').textContent = '▶';
+    toggleModal(false);
+  }
+
+  async function autoConfigureVoice() {
+    try {
+      const status = await sendMessage('GET_VOICE_STATUS');
+      if (status.configured) {
+        if (settings.autoSpeakResponses !== false) {
+          settings.autoSpeakResponses = true;
+          const autoSpeak = document.getElementById('ai-auto-speak');
+          if (autoSpeak) autoSpeak.checked = true;
+        }
+        syncAudioBridgeConfig();
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function injectAudioToMeeting(audioBase64) {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        window.removeEventListener('ai-meeting-tts-done', onDone);
+        reject(new Error('Voice injection timed out'));
+      }, 60000);
+
+      const onDone = (e) => {
+        clearTimeout(timeout);
+        window.removeEventListener('ai-meeting-tts-done', onDone);
+        if (e.detail?.ok) resolve();
+        else reject(new Error(e.detail?.error || 'Voice injection failed'));
+      };
+
+      window.addEventListener('ai-meeting-tts-done', onDone);
+      window.dispatchEvent(
+        new CustomEvent('ai-meeting-tts-request', { detail: { audioBase64 } })
+      );
+    });
   }
 
   async function ensureImageAnalysis() {
@@ -265,6 +356,9 @@
       saveSetting('autoTranslate', e.target.checked);
     });
 
+    document.getElementById('ai-auto-speak').addEventListener('change', (e) => {
+      saveSetting('autoSpeakResponses', e.target.checked);
+    });
     document.getElementById('ai-add-participant').addEventListener('click', addParticipant);
     document.getElementById('ai-start-video').addEventListener('click', toggleVideoRecording);
     document.getElementById('ai-end-meeting').addEventListener('click', endMeetingAndArchive);
@@ -274,6 +368,9 @@
     document.getElementById('ai-modal-close').addEventListener('click', () => closeModal());
     document.getElementById('ai-meeting-modal-backdrop').addEventListener('click', () => closeModal());
     document.getElementById('ai-modal-copy').addEventListener('click', copySuggestedResponse);
+    document.getElementById('ai-modal-speak').addEventListener('click', () => {
+      if (lastSuggestedResponse) speakText(lastSuggestedResponse);
+    });
 
     window.addEventListener('resize', updateModalLayout);
 
@@ -382,6 +479,7 @@
       document.getElementById('ai-self-input-lang').value = settings.selfInputLanguage || 'auto';
       document.getElementById('ai-responses-toggle').checked = settings.responsesEnabled || false;
       document.getElementById('ai-auto-translate').checked = settings.autoTranslate !== false;
+      document.getElementById('ai-auto-speak').checked = settings.autoSpeakResponses || false;
       updateClientCommBadge(settings.clientCommunicationLanguage || settings.clientLanguage || 'en');
       updateClientLanguageBadge(settings.clientLanguage || 'en');
       updateModalSections(settings.clientLanguage || 'en');
@@ -389,6 +487,7 @@
       currentParticipantId = settings.currentParticipantId || currentParticipantId;
       renderParticipantList();
       if (settings.responsesEnabled) toggleModal(true);
+      else if (settings.stealthMode !== false) toggleModal(false);
     } catch (err) {
       console.error('Failed to load settings:', err);
     }
@@ -399,6 +498,8 @@
       const status = await sendMessage('GET_API_STATUS');
       const warning = document.getElementById('ai-api-warning');
       warning.hidden = status.configured;
+      const voiceWarning = document.getElementById('ai-voice-warning');
+      if (voiceWarning) voiceWarning.hidden = status.voiceConfigured;
     } catch {
       /* ignore */
     }
@@ -544,10 +645,9 @@
 
       status.textContent = `Archived: ${archive.title}. Insights saved for future meetings.`;
       alert(
-        `Meeting archived successfully.\n\n` +
-        `Text transcript downloaded.\n` +
-        (videoFileName ? `Video saved: ${videoFileName}\n` : '') +
-        `AI analysis stored — will be used as reference in future meetings.`
+        `Meeting archived.\n` +
+        (videoFileName ? `Video: ${videoFileName}\n` : '') +
+        `Transcript saved.`
       );
     } catch (err) {
       status.textContent = `Archive failed: ${err.message}`;
@@ -778,7 +878,7 @@
           }
         }
 
-        if (participantRole !== 'self' && settings.responsesEnabled) {
+        if (participantRole !== 'self' && (settings.responsesEnabled || settings.autoSpeakResponses)) {
           scheduleAIResponse(text, result.entry);
         }
       }
@@ -850,6 +950,11 @@
         setTimeout(() => { e.currentTarget.textContent = '📋'; }, 1500);
       } catch { /* ignore */ }
     });
+    div.querySelector('.client-facing-speak')?.addEventListener('click', (e) => {
+      const text = e.currentTarget.dataset.text;
+      const lang = e.currentTarget.dataset.lang;
+      if (text) speakText(text, lang, e.currentTarget);
+    });
     container.scrollTop = container.scrollHeight;
   }
 
@@ -875,14 +980,56 @@
         : '';
     }
 
+    const commLang =
+      entry.clientCommunicationLanguage ||
+      settings.clientCommunicationLanguage ||
+      settings.clientLanguage ||
+      'en';
+
     return `<div class="client-facing">
       <div class="client-facing-header">
         <span>Say to client (${clientCommLabel})</span>
-        <button type="button" class="client-facing-copy" data-text="${escapeAttr(entry.clientFacingText)}" title="Copy">📋</button>
+        <span class="client-facing-actions">
+          <button type="button" class="client-facing-speak" data-text="${escapeAttr(entry.clientFacingText)}" data-lang="${escapeAttr(commLang)}" title="Send to meeting">🔊</button>
+          <button type="button" class="client-facing-copy" data-text="${escapeAttr(entry.clientFacingText)}" title="Copy">📋</button>
+        </span>
       </div>
       ${escapeHtml(entry.clientFacingText)}
       ${formatPronunciationHtml(entry.clientFacingPronunciation)}
     </div>`;
+  }
+
+  async function speakText(text, langCode, buttonEl) {
+    if (!text?.trim() || isSpeaking) return;
+
+    const lang =
+      langCode ||
+      settings.clientCommunicationLanguage ||
+      settings.clientLanguage ||
+      'en';
+
+    const btn = buttonEl || document.getElementById('ai-modal-speak');
+    const originalLabel = btn?.textContent;
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = '⏳';
+    }
+    setStatus('Sending voice to meeting...', true);
+    isSpeaking = true;
+
+    try {
+      const result = await sendMessage('SYNTHESIZE_VOICE', { text: text.trim(), langCode: lang });
+      await injectAudioToMeeting(result.audioBase64);
+      setStatus('Ready', true);
+    } catch (err) {
+      setStatus(err.message || 'Voice failed', false);
+    }
+
+    isSpeaking = false;
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalLabel || '🔊';
+    }
   }
 
   function syncSettingsUI() {
@@ -901,6 +1048,8 @@
     if (clientInput) clientInput.value = settings.clientInputLanguage || 'auto';
     if (selfInput) selfInput.value = settings.selfInputLanguage || 'auto';
     if (autoTranslate) autoTranslate.checked = settings.autoTranslate !== false;
+    const autoSpeak = document.getElementById('ai-auto-speak');
+    if (autoSpeak) autoSpeak.checked = settings.autoSpeakResponses || false;
   }
 
   function syncTranscriptFromStorage(history) {
@@ -924,10 +1073,16 @@
       return;
     }
 
-    if (settings.responsesEnabled) toggleModal(true);
+    const showModal = settings.responsesEnabled;
+    if (showModal) toggleModal(true);
 
     const responseEl = document.getElementById('ai-modal-response');
-    responseEl.innerHTML = '<div class="ai-modal-loading"><div class="ai-spinner"></div> Generating spoken response...</div>';
+    if (showModal) {
+      responseEl.innerHTML =
+        '<div class="ai-modal-loading"><div class="ai-spinner"></div> Preparing response...</div>';
+    } else {
+      setStatus('Preparing response...', true);
+    }
 
     try {
       const result = await sendMessage('GENERATE_RESPONSE', {
@@ -957,7 +1112,18 @@
           ? `<div class="response-translation">Meaning (${LANG_LABELS[settings.displayLanguage] || 'your language'}): ${escapeHtml(result.responseTranslation)}</div>`
           : '';
       const pronunciationNote = formatPronunciationHtml(result.pronunciationGuide);
-      responseEl.innerHTML = `${escapeHtml(lastSuggestedResponse)}${pronunciationNote}${intentNote}${translationNote}`;
+      if (showModal) {
+        responseEl.innerHTML = `${escapeHtml(lastSuggestedResponse)}${pronunciationNote}${intentNote}${translationNote}`;
+      }
+
+      if (settings.autoSpeakResponses && lastSuggestedResponse) {
+        await speakText(
+          lastSuggestedResponse,
+          settings.clientCommunicationLanguage || settings.clientLanguage || 'en'
+        );
+      } else {
+        setStatus('Ready', true);
+      }
     } catch (err) {
       lastSuggestedResponse = '';
       responseEl.textContent = `Error: ${err.message || 'Failed to generate response'}`;

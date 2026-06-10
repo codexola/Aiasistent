@@ -24,6 +24,15 @@ import {
   analyzeAndArchiveMeeting,
   updateLiveParticipantProfiles
 } from './meeting-intelligence.js';
+import {
+  createVoiceClone,
+  synthesizeSpeech,
+  saveVoiceSample,
+  deleteVoiceSample,
+  hasVoiceConfigured,
+  hasVoiceSamples,
+  clearVoiceClone
+} from './voice-service.js';
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   handleMessage(message, sender).then(sendResponse).catch((err) => {
@@ -183,6 +192,31 @@ async function handleMessage(message, sender) {
     case MESSAGE_TYPES.GET_LIVE_PROFILES:
       return getLiveProfiles();
 
+    case MESSAGE_TYPES.SAVE_VOICE_SAMPLE:
+      return saveVoiceSample(message.payload);
+
+    case MESSAGE_TYPES.DELETE_VOICE_SAMPLE:
+      return deleteVoiceSample(message.payload);
+
+    case MESSAGE_TYPES.CREATE_VOICE_CLONE:
+      return createVoiceClone();
+
+    case MESSAGE_TYPES.SYNTHESIZE_VOICE:
+      return synthesizeSpeech(message.payload.text, message.payload.langCode);
+
+    case MESSAGE_TYPES.CLEAR_VOICE_CLONE:
+      return clearVoiceClone();
+
+    case MESSAGE_TYPES.GET_VOICE_STATUS: {
+      const settings = await getSettings();
+      return {
+        configured: hasVoiceConfigured(settings),
+        hasSamples: hasVoiceSamples(settings),
+        sampleCount: (settings.voiceSamples || []).length,
+        voiceId: settings.elevenLabsVoiceId || null
+      };
+    }
+
     case MESSAGE_TYPES.GET_API_STATUS: {
       const settings = await getSettings();
       const archives = await getMeetingArchives();
@@ -190,7 +224,8 @@ async function handleMessage(message, sender) {
         configured: hasApiKey(settings),
         provider: settings.apiProvider,
         documentCount: (settings.referenceDocuments || []).length,
-        archiveCount: archives.length
+        archiveCount: archives.length,
+        voiceConfigured: hasVoiceConfigured(settings)
       };
     }
 

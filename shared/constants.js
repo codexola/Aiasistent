@@ -32,7 +32,18 @@ export const DEFAULT_SETTINGS = {
   referenceDocuments: [],
   participants: DEFAULT_PARTICIPANTS,
   currentParticipantId: 'client-1',
-  usePastMeetingInsights: true
+  usePastMeetingInsights: true,
+  elevenLabsApiKey: '',
+  elevenLabsVoiceId: '',
+  voiceCloneName: 'My Meeting Voice',
+  voiceSamples: [],
+  voiceStability: 0.38,
+  voiceSimilarity: 0.88,
+  voiceStyle: 0.42,
+  autoSpeakResponses: false,
+  muteMicDuringSpeak: true,
+  stealthMode: true,
+  audioBridgeAuto: true
 };
 
 export const STORAGE_KEYS = {
@@ -73,7 +84,13 @@ export const MESSAGE_TYPES = {
   GET_MEETING_ARCHIVES: 'GET_MEETING_ARCHIVES',
   DELETE_MEETING_ARCHIVE: 'DELETE_MEETING_ARCHIVE',
   UPDATE_LIVE_PROFILES: 'UPDATE_LIVE_PROFILES',
-  GET_LIVE_PROFILES: 'GET_LIVE_PROFILES'
+  GET_LIVE_PROFILES: 'GET_LIVE_PROFILES',
+  SAVE_VOICE_SAMPLE: 'SAVE_VOICE_SAMPLE',
+  DELETE_VOICE_SAMPLE: 'DELETE_VOICE_SAMPLE',
+  CREATE_VOICE_CLONE: 'CREATE_VOICE_CLONE',
+  SYNTHESIZE_VOICE: 'SYNTHESIZE_VOICE',
+  GET_VOICE_STATUS: 'GET_VOICE_STATUS',
+  CLEAR_VOICE_CLONE: 'CLEAR_VOICE_CLONE'
 };
 
 export const SPEECH_LANG_MAP = {

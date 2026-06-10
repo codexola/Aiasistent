@@ -13,6 +13,7 @@ document.querySelectorAll('.tab').forEach((tab) => {
     tab.classList.add('active');
     document.getElementById(`tab-${tab.dataset.tab}`).classList.add('active');
     if (tab.dataset.tab === 'archives') loadArchives();
+    if (tab.dataset.tab === 'voice') loadVoiceTab();
   });
 });
 
@@ -38,6 +39,14 @@ async function updateReadiness() {
       ? `Documents: ${docCount} uploaded`
       : 'Documents: none uploaded yet';
     docsEl.className = `readiness-item ${docCount ? 'ok' : 'warn'}`;
+
+    const voiceEl = document.getElementById('readiness-voice');
+    if (voiceEl) {
+      voiceEl.textContent = status.voiceConfigured
+        ? 'Voice: cloned & ready'
+        : 'Voice: not configured (My Voice tab)';
+      voiceEl.className = `readiness-item ${status.voiceConfigured ? 'ok' : 'warn'}`;
+    }
   } catch {
     /* ignore */
   }
@@ -56,6 +65,9 @@ async function loadSettings() {
   document.getElementById('popup-client-input-lang').value = settings.clientInputLanguage || 'auto';
   document.getElementById('popup-self-input-lang').value = settings.selfInputLanguage || 'auto';
   document.getElementById('popup-use-past-insights').checked = settings.usePastMeetingInsights !== false;
+  document.getElementById('elevenlabs-key').value = settings.elevenLabsApiKey || '';
+  document.getElementById('voice-clone-name').value = settings.voiceCloneName || 'My Meeting Voice';
+  document.getElementById('popup-auto-speak').checked = settings.autoSpeakResponses || false;
 
   const isClaude = settings.apiProvider === 'claude';
   document.getElementById('openai-key-group').style.display = isClaude ? 'none' : 'block';
@@ -65,6 +77,7 @@ async function loadSettings() {
   updateReadiness();
   loadImageAnalysis(settings.referenceDocuments || []);
   loadArchives();
+  loadVoiceTab();
 }
 
 async function loadArchives() {
@@ -389,4 +402,179 @@ document.getElementById('reanalyze-images').addEventListener('click', async () =
 });
 
 setupImagePasteZone();
+setupVoiceTab();
 loadSettings();
+
+let voiceMediaRecorder = null;
+let voiceRecordChunks = [];
+let voiceRecordStart = null;
+let voiceRecordTimer = null;
+
+async function saveVoiceSettings() {
+  await sendMessage(MESSAGE_TYPES.SETTINGS_UPDATED, {
+    elevenLabsApiKey: document.getElementById('elevenlabs-key').value.trim(),
+    voiceCloneName: document.getElementById('voice-clone-name').value.trim() || 'My Meeting Voice',
+    autoSpeakResponses: document.getElementById('popup-auto-speak').checked
+  });
+}
+
+async function loadVoiceTab() {
+  const settings = await sendMessage(MESSAGE_TYPES.GET_SETTINGS);
+  renderVoiceSampleList(settings.voiceSamples || []);
+
+  try {
+    const status = await sendMessage(MESSAGE_TYPES.GET_VOICE_STATUS);
+    const panel = document.getElementById('voice-status-panel');
+    if (panel) {
+      if (status.configured) {
+        panel.textContent = `Voice clone ready (${status.sampleCount} sample(s) on file)`;
+        panel.className = 'readiness-item ok';
+      } else if (status.hasSamples) {
+        panel.textContent = `${status.sampleCount} sample(s) uploaded — click Create Voice Clone`;
+        panel.className = 'readiness-item warn';
+      } else {
+        panel.textContent = 'Upload or record voice samples to create your clone';
+        panel.className = 'readiness-item warn';
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+function renderVoiceSampleList(samples) {
+  const list = document.getElementById('voice-sample-list');
+  if (!list) return;
+  if (!samples.length) {
+    list.innerHTML = '';
+    return;
+  }
+  list.innerHTML = samples
+    .map(
+      (s) => `
+    <li class="voice-sample-item">
+      <span>${escapeHtml(s.name)}</span>
+      <button type="button" class="voice-sample-delete" data-name="${escapeHtml(s.name)}">×</button>
+    </li>`
+    )
+    .join('');
+
+  list.querySelectorAll('.voice-sample-delete').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      await sendMessage(MESSAGE_TYPES.DELETE_VOICE_SAMPLE, btn.dataset.name);
+      loadVoiceTab();
+      loadSettings();
+    });
+  });
+}
+
+function setupVoiceTab() {
+  document.getElementById('voice-sample-upload')?.addEventListener('change', async (e) => {
+    const files = Array.from(e.target.files || []);
+    for (const file of files) {
+      if (file.size > 10 * 1024 * 1024) {
+        alert(`${file.name} is too large (max 10 MB).`);
+        continue;
+      }
+      const dataUrl = await readFileAsDataUrl(file);
+      await sendMessage(MESSAGE_TYPES.SAVE_VOICE_SAMPLE, {
+        name: file.name,
+        dataUrl,
+        uploadedAt: Date.now()
+      });
+    }
+    e.target.value = '';
+    await saveVoiceSettings();
+    loadVoiceTab();
+    updateReadiness();
+  });
+
+  document.getElementById('voice-record-btn')?.addEventListener('click', startVoiceRecording);
+  document.getElementById('voice-stop-record')?.addEventListener('click', stopVoiceRecording);
+
+  document.getElementById('create-voice-clone')?.addEventListener('click', async () => {
+    const statusEl = document.getElementById('voice-status');
+    statusEl.textContent = 'Creating voice clone — this may take a minute...';
+    try {
+      await saveVoiceSettings();
+      const result = await sendMessage(MESSAGE_TYPES.CREATE_VOICE_CLONE);
+      statusEl.textContent = `Voice clone created: ${result.name || 'Ready'}`;
+      loadVoiceTab();
+      updateReadiness();
+    } catch (err) {
+      statusEl.textContent = err.message || 'Voice clone failed';
+    }
+  });
+
+  document.getElementById('test-voice-speak')?.addEventListener('click', async () => {
+    const statusEl = document.getElementById('voice-status');
+    statusEl.textContent = 'Generating test speech...';
+    try {
+      await saveVoiceSettings();
+      const lang = document.getElementById('popup-client-comm-lang')?.value || 'en';
+      const samples = {
+        en: 'Hello, thank you for joining the call. I am ready to discuss the project details with you.',
+        es: 'Hola, gracias por unirse a la llamada. Estoy listo para discutir los detalles del proyecto.',
+        pt: 'Olá, obrigado por entrar na chamada. Estou pronto para discutir os detalhes do projeto.',
+        ja: 'こんにちは、通話にご参加いただきありがとうございます。プロジェクトの詳細についてお話しできます。',
+        zh: '您好，感谢您加入通话。我已经准备好讨论项目细节了。'
+      };
+      const result = await sendMessage(MESSAGE_TYPES.SYNTHESIZE_VOICE, {
+        text: samples[lang] || samples.en,
+        langCode: lang
+      });
+      const audio = new Audio(`data:${result.mimeType};base64,${result.audioBase64}`);
+      await audio.play();
+      statusEl.textContent = 'Test speech played.';
+    } catch (err) {
+      statusEl.textContent = err.message || 'Test failed';
+    }
+  });
+
+  document.getElementById('popup-auto-speak')?.addEventListener('change', saveVoiceSettings);
+}
+
+async function startVoiceRecording() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    voiceRecordChunks = [];
+    voiceMediaRecorder = new MediaRecorder(stream);
+    voiceMediaRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) voiceRecordChunks.push(e.data);
+    };
+    voiceMediaRecorder.start();
+    voiceRecordStart = Date.now();
+    document.getElementById('voice-recording-panel').hidden = false;
+    document.getElementById('voice-record-btn').disabled = true;
+    voiceRecordTimer = setInterval(() => {
+      const sec = Math.floor((Date.now() - voiceRecordStart) / 1000);
+      const m = Math.floor(sec / 60);
+      const s = sec % 60;
+      document.getElementById('voice-recording-timer').textContent = `${m}:${String(s).padStart(2, '0')}`;
+    }, 500);
+  } catch (err) {
+    alert(err.message || 'Microphone access required');
+  }
+}
+
+async function stopVoiceRecording() {
+  if (!voiceMediaRecorder) return;
+  clearInterval(voiceRecordTimer);
+
+  await new Promise((resolve) => {
+    voiceMediaRecorder.onstop = resolve;
+    voiceMediaRecorder.stop();
+    voiceMediaRecorder.stream.getTracks().forEach((t) => t.stop());
+  });
+
+  const blob = new Blob(voiceRecordChunks, { type: 'audio/webm' });
+  const dataUrl = await readFileAsDataUrl(blob);
+  const name = `recording-${Date.now()}.webm`;
+  await sendMessage(MESSAGE_TYPES.SAVE_VOICE_SAMPLE, { name, dataUrl, uploadedAt: Date.now() });
+
+  document.getElementById('voice-recording-panel').hidden = true;
+  document.getElementById('voice-record-btn').disabled = false;
+  voiceMediaRecorder = null;
+  loadVoiceTab();
+  updateReadiness();
+}

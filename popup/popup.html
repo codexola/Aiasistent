@@ -16,6 +16,7 @@
     <nav class="tabs">
       <button class="tab active" data-tab="documents">Documents</button>
       <button class="tab" data-tab="archives">Archives</button>
+      <button class="tab" data-tab="voice">My Voice</button>
       <button class="tab" data-tab="settings">API Settings</button>
     </nav>
 
@@ -23,6 +24,7 @@
       <div class="readiness" id="readiness-panel">
         <div class="readiness-item" id="readiness-api">API: checking...</div>
         <div class="readiness-item" id="readiness-docs">Documents: checking...</div>
+        <div class="readiness-item" id="readiness-voice">Voice: checking...</div>
       </div>
       <p class="hint">Upload reference materials before your meeting.</p>
 
@@ -93,6 +95,51 @@
       <div class="archive-list" id="archive-list">
         <p class="empty">No archived meetings yet. Click "End & Archive" in the meeting sidebar when done.</p>
       </div>
+    </section>
+
+    <section id="tab-voice" class="tab-panel">
+      <div class="readiness-item" id="voice-status-panel">Voice clone: checking...</div>
+      <p class="hint">Clone your voice from recordings so the client hears <em>you</em> speaking AI-generated responses — including natural intonation and speech patterns from your samples.</p>
+
+      <div class="form-group">
+        <label>ElevenLabs API Key</label>
+        <input type="password" id="elevenlabs-key" placeholder="Required for voice cloning" />
+        <p class="field-hint"><a href="https://elevenlabs.io" target="_blank" rel="noopener">elevenlabs.io</a> — used to clone your voice and generate speech. OpenAI/Claude handle text; ElevenLabs handles your voice.</p>
+      </div>
+
+      <div class="form-group">
+        <label>Voice Clone Name</label>
+        <input type="text" id="voice-clone-name" placeholder="My Meeting Voice" />
+      </div>
+
+      <div class="voice-actions">
+        <label class="doc-type-btn">
+          <input type="file" id="voice-sample-upload" accept="audio/*" multiple hidden />
+          📁 Upload Samples
+        </label>
+        <button type="button" id="voice-record-btn" class="doc-type-btn">🎙 Record Sample</button>
+      </div>
+      <p class="field-hint">Upload 1–5 minutes of your voice (clear speech, natural pace). Include natural pauses — the clone learns your intonation and style.</p>
+
+      <div class="voice-recording-panel" id="voice-recording-panel" hidden>
+        <span id="voice-recording-timer">0:00</span>
+        <button type="button" id="voice-stop-record" class="btn-danger">Stop & Save</button>
+      </div>
+
+      <ul class="voice-sample-list" id="voice-sample-list"></ul>
+
+      <button type="button" id="create-voice-clone" class="btn-primary">Create / Update Voice Clone</button>
+      <button type="button" id="test-voice-speak" class="btn-secondary">Test Speak</button>
+
+      <div class="form-group" style="margin-top:12px">
+        <label class="ai-toggle-inline">
+          <input type="checkbox" id="popup-auto-speak" checked />
+          Auto-send voice to meeting (recommended)
+        </label>
+      </div>
+
+      <p class="field-hint">Speech is sent directly into your browser meeting (mic + your cloned voice). No extra software required. Join the meeting <strong>after</strong> opening this page so audio links automatically.</p>
+      <p class="status" id="voice-status"></p>
     </section>
 
     <section id="tab-settings" class="tab-panel">
