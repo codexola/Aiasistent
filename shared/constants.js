@@ -53,7 +53,9 @@ export const STORAGE_KEYS = {
   IMAGE_ANALYSIS: 'aiMeetingImageAnalysis',
   SESSION: 'aiMeetingSession',
   MEETING_ARCHIVES: 'aiMeetingArchives',
-  LIVE_PROFILES: 'aiMeetingLiveProfiles'
+  LIVE_PROFILES: 'aiMeetingLiveProfiles',
+  PERMANENT_DOCUMENTS: 'aiMeetingPermanentDocuments',
+  INITIALIZED: 'aiMeetingInitialized'
 };
 
 export const MAX_MEETING_ARCHIVES = 30;
@@ -90,7 +92,8 @@ export const MESSAGE_TYPES = {
   CREATE_VOICE_CLONE: 'CREATE_VOICE_CLONE',
   SYNTHESIZE_VOICE: 'SYNTHESIZE_VOICE',
   GET_VOICE_STATUS: 'GET_VOICE_STATUS',
-  CLEAR_VOICE_CLONE: 'CLEAR_VOICE_CLONE'
+  CLEAR_VOICE_CLONE: 'CLEAR_VOICE_CLONE',
+  GET_PERMANENT_DOCUMENTS: 'GET_PERMANENT_DOCUMENTS'
 };
 
 export const SPEECH_LANG_MAP = {

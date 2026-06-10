@@ -35,9 +35,10 @@ async function updateReadiness() {
     apiEl.className = `readiness-item ${status.configured ? 'ok' : 'warn'}`;
 
     const docCount = status.documentCount || 0;
+    const userCount = status.userDocumentCount || 0;
     docsEl.textContent = docCount
-      ? `Documents: ${docCount} uploaded`
-      : 'Documents: none uploaded yet';
+      ? `Documents: ${docCount} ready (${status.permanentDocumentCount || 0} fixed base${userCount ? ` + ${userCount} uploaded` : ''})`
+      : 'Documents: loading fixed base...';
     docsEl.className = `readiness-item ${docCount ? 'ok' : 'warn'}`;
 
     const voiceEl = document.getElementById('readiness-voice');
@@ -73,6 +74,7 @@ async function loadSettings() {
   document.getElementById('openai-key-group').style.display = isClaude ? 'none' : 'block';
   document.getElementById('claude-key-group').style.display = isClaude ? 'block' : 'none';
 
+  renderPermanentDocList();
   renderDocList(settings.referenceDocuments || []);
   updateReadiness();
   loadImageAnalysis(settings.referenceDocuments || []);
@@ -141,10 +143,29 @@ async function loadImageAnalysis(docs) {
   }
 }
 
+function renderPermanentDocList() {
+  sendMessage(MESSAGE_TYPES.GET_PERMANENT_DOCUMENTS)
+    .then((docs) => {
+      const list = document.getElementById('permanent-doc-list');
+      if (!list) return;
+      list.innerHTML = (docs || [])
+        .map(
+          (d) => `
+        <li class="permanent-doc-item">
+          <span class="doc-name">${escapeHtml(d.name)}</span>
+          <span class="doc-type-badge">${escapeHtml(d.type)}</span>
+          <span class="permanent-lock" title="Permanent record">🔒</span>
+        </li>`
+        )
+        .join('');
+    })
+    .catch(() => {});
+}
+
 function renderDocList(docs) {
   const list = document.getElementById('doc-list');
   if (!docs.length) {
-    list.innerHTML = '<p class="empty">No documents uploaded yet.</p>';
+    list.innerHTML = '<p class="empty">No extra documents uploaded. Fixed base is used automatically.</p>';
     return;
   }
 

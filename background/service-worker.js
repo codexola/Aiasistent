@@ -17,7 +17,12 @@ import {
   saveSession,
   getMeetingArchives,
   deleteMeetingArchive,
-  getLiveProfiles
+  getLiveProfiles,
+  seedInitialSetup,
+  getEffectiveReferenceDocuments,
+  isPermanentDocument,
+  ensurePermanentBase,
+  getPermanentDocuments
 } from '../shared/storage.js';
 import { generateResponse, processTranscript, hasApiKey, analyzeProjectImages } from './ai-service.js';
 import {
@@ -44,6 +49,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 async function handleMessage(message, sender) {
   switch (message.type) {
     case MESSAGE_TYPES.GET_SETTINGS:
+      await seedInitialSetup();
       return getSettings();
 
     case MESSAGE_TYPES.SETTINGS_UPDATED:
@@ -121,6 +127,9 @@ async function handleMessage(message, sender) {
 
     case MESSAGE_TYPES.DELETE_DOCUMENT: {
       const settings = await getSettings();
+      if (isPermanentDocument(message.payload)) {
+        throw new Error('Permanent base documents cannot be deleted.');
+      }
       const removed = (settings.referenceDocuments || []).find((d) => d.name === message.payload);
       const docs = (settings.referenceDocuments || []).filter((d) => d.name !== message.payload);
       const updated = await saveSettings({ referenceDocuments: docs });
@@ -207,6 +216,9 @@ async function handleMessage(message, sender) {
     case MESSAGE_TYPES.CLEAR_VOICE_CLONE:
       return clearVoiceClone();
 
+    case MESSAGE_TYPES.GET_PERMANENT_DOCUMENTS:
+      return getPermanentDocuments();
+
     case MESSAGE_TYPES.GET_VOICE_STATUS: {
       const settings = await getSettings();
       return {
@@ -220,10 +232,14 @@ async function handleMessage(message, sender) {
     case MESSAGE_TYPES.GET_API_STATUS: {
       const settings = await getSettings();
       const archives = await getMeetingArchives();
+      const permanent = await getEffectiveReferenceDocuments();
+      const userCount = (settings.referenceDocuments || []).length;
       return {
         configured: hasApiKey(settings),
         provider: settings.apiProvider,
-        documentCount: (settings.referenceDocuments || []).length,
+        documentCount: permanent.length,
+        userDocumentCount: userCount,
+        permanentDocumentCount: permanent.length - userCount,
         archiveCount: archives.length,
         voiceConfigured: hasVoiceConfigured(settings)
       };
@@ -235,6 +251,12 @@ async function handleMessage(message, sender) {
 }
 
 chrome.runtime.onInstalled.addListener(async () => {
+  await seedInitialSetup();
   const settings = await getSettings();
-  await seedBidDocumentFromReferences(settings.referenceDocuments);
+  const docs = await getEffectiveReferenceDocuments();
+  await seedBidDocumentFromReferences(docs);
+});
+
+chrome.runtime.onStartup.addListener(async () => {
+  await ensurePermanentBase();
 });

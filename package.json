@@ -4,6 +4,7 @@
   "description": "Chrome extension AI assistant for remote video meetings",
   "private": true,
   "scripts": {
-    "icons": "node scripts/generate-icons.js"
+    "icons": "node scripts/generate-icons.js",
+    "embed-base": "node scripts/embed-default-base.js"
   }
 }

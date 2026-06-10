@@ -1,4 +1,76 @@
 import { STORAGE_KEYS, DEFAULT_SETTINGS, MAX_MEETING_ARCHIVES } from './constants.js';
+import { DEFAULT_PERMANENT_DOCUMENTS } from './default-base.js';
+import { DEFAULT_API_CONFIG } from './default-config.js';
+import { LOCAL_API_CONFIG } from './default-config.local.js';
+
+const MERGED_DEFAULT_CONFIG = { ...DEFAULT_API_CONFIG, ...LOCAL_API_CONFIG };
+
+export async function getPermanentDocuments() {
+  const result = await chrome.storage.local.get(STORAGE_KEYS.PERMANENT_DOCUMENTS);
+  return result[STORAGE_KEYS.PERMANENT_DOCUMENTS] || DEFAULT_PERMANENT_DOCUMENTS;
+}
+
+export async function ensurePermanentBase() {
+  const result = await chrome.storage.local.get(STORAGE_KEYS.PERMANENT_DOCUMENTS);
+  if (!result[STORAGE_KEYS.PERMANENT_DOCUMENTS]?.length) {
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.PERMANENT_DOCUMENTS]: DEFAULT_PERMANENT_DOCUMENTS
+    });
+  }
+  return getPermanentDocuments();
+}
+
+export async function getEffectiveReferenceDocuments() {
+  const settings = await getSettings();
+  const permanent = await getPermanentDocuments();
+  const userDocs = settings.referenceDocuments || [];
+  if (!userDocs.length) return permanent;
+  return [...permanent, ...userDocs];
+}
+
+export async function seedInitialSetup() {
+  await ensurePermanentBase();
+
+  const stored = await chrome.storage.local.get([
+    STORAGE_KEYS.SETTINGS,
+    STORAGE_KEYS.INITIALIZED
+  ]);
+
+  if (!stored[STORAGE_KEYS.INITIALIZED]) {
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.SETTINGS]: { ...DEFAULT_SETTINGS, ...MERGED_DEFAULT_CONFIG },
+      [STORAGE_KEYS.INITIALIZED]: true
+    });
+    return getSettings();
+  }
+
+  const existing = { ...DEFAULT_SETTINGS, ...stored[STORAGE_KEYS.SETTINGS] };
+  let changed = false;
+  Object.entries(MERGED_DEFAULT_CONFIG).forEach(([key, value]) => {
+    if (
+      (existing[key] === undefined || existing[key] === '' || existing[key] === null) &&
+      value !== undefined &&
+      value !== ''
+    ) {
+      existing[key] = value;
+      changed = true;
+    }
+  });
+  if (changed) {
+    await chrome.storage.local.set({ [STORAGE_KEYS.SETTINGS]: existing });
+  }
+  return getSettings();
+}
+
+export function isPermanentDocument(docOrName) {
+  const name = typeof docOrName === 'string' ? docOrName : docOrName?.name;
+  const id = typeof docOrName === 'object' ? docOrName?.id : null;
+  return (
+    Boolean(id?.startsWith('permanent-')) ||
+    Boolean(name?.startsWith('permanent-')) ||
+    DEFAULT_PERMANENT_DOCUMENTS.some((d) => d.name === name || d.id === id)
+  );
+}
 
 export async function getSettings() {
   const result = await chrome.storage.local.get(STORAGE_KEYS.SETTINGS);
@@ -144,7 +216,8 @@ export async function clearSession() {
   await chrome.storage.local.set({ [STORAGE_KEYS.LIVE_PROFILES]: {} });
   await chrome.storage.local.set({ [STORAGE_KEYS.SESSION]: null });
   const settings = await getSettings();
-  const bidRef = (settings.referenceDocuments || []).find((d) => d.type === 'bid-document');
+  const allDocs = await getEffectiveReferenceDocuments();
+  const bidRef = allDocs.find((d) => d.type === 'bid-document');
   if (bidRef?.content) {
     await saveBidDocument({
       sourceContent: bidRef.content,

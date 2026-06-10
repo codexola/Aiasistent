@@ -7,7 +7,8 @@ import {
   getImageAnalysis,
   saveImageAnalysis,
   getParticipants,
-  getLiveProfiles
+  getLiveProfiles,
+  getEffectiveReferenceDocuments
 } from '../shared/storage.js';
 import {
   getPastMeetingContext,
@@ -52,7 +53,7 @@ function normalizePronunciation(value) {
 }
 
 async function buildSystemPrompt(settings, bidDoc) {
-  const docs = settings.referenceDocuments || [];
+  const docs = await getEffectiveReferenceDocuments();
   const imageAnalysis = await getImageAnalysis();
   const participants = settings.participants || (await getParticipants());
   const liveProfiles = await getLiveProfiles();
@@ -344,7 +345,8 @@ Return JSON only:
 
 export async function analyzeProjectImages() {
   const settings = await getSettings();
-  const imageDocs = getImageDocuments(settings.referenceDocuments);
+  const allDocs = await getEffectiveReferenceDocuments();
+  const imageDocs = getImageDocuments(allDocs);
   if (!imageDocs.length) return null;
 
   if (!hasApiKey(settings)) {
@@ -404,7 +406,7 @@ export async function generateResponse(payload) {
   const settings = await getSettings();
   const conversation = await getConversation();
   const bidDoc = await getBidDocument();
-  const imageDocs = getImageDocuments(settings.referenceDocuments);
+  const imageDocs = getImageDocuments(await getEffectiveReferenceDocuments());
   const participants = settings.participants || (await getParticipants());
 
   const latestClientMessage =
