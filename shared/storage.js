@@ -1,8 +1,12 @@
-import { STORAGE_KEYS, DEFAULT_SETTINGS } from './constants.js';
+import { STORAGE_KEYS, DEFAULT_SETTINGS, MAX_MEETING_ARCHIVES } from './constants.js';
 
 export async function getSettings() {
   const result = await chrome.storage.local.get(STORAGE_KEYS.SETTINGS);
-  return { ...DEFAULT_SETTINGS, ...result[STORAGE_KEYS.SETTINGS] };
+  const merged = { ...DEFAULT_SETTINGS, ...result[STORAGE_KEYS.SETTINGS] };
+  if (!merged.participants?.length) {
+    merged.participants = DEFAULT_SETTINGS.participants;
+  }
+  return merged;
 }
 
 export async function saveSettings(settings) {
@@ -69,9 +73,76 @@ export async function saveImageAnalysis(analysis) {
   return analysis;
 }
 
+export async function getSession() {
+  const result = await chrome.storage.local.get(STORAGE_KEYS.SESSION);
+  return result[STORAGE_KEYS.SESSION] || null;
+}
+
+export async function saveSession(session) {
+  await chrome.storage.local.set({ [STORAGE_KEYS.SESSION]: session });
+  return session;
+}
+
+export async function startSession(participants) {
+  const session = {
+    id: crypto.randomUUID(),
+    startedAt: Date.now(),
+    endedAt: null,
+    participants: participants || [],
+    recordingActive: false
+  };
+  await saveSession(session);
+  await chrome.storage.local.set({ [STORAGE_KEYS.LIVE_PROFILES]: {} });
+  return session;
+}
+
+export async function getLiveProfiles() {
+  const result = await chrome.storage.local.get(STORAGE_KEYS.LIVE_PROFILES);
+  return result[STORAGE_KEYS.LIVE_PROFILES] || {};
+}
+
+export async function saveLiveProfiles(profiles) {
+  await chrome.storage.local.set({ [STORAGE_KEYS.LIVE_PROFILES]: profiles });
+  return profiles;
+}
+
+export async function getMeetingArchives() {
+  const result = await chrome.storage.local.get(STORAGE_KEYS.MEETING_ARCHIVES);
+  return result[STORAGE_KEYS.MEETING_ARCHIVES] || [];
+}
+
+export async function saveMeetingArchive(archive) {
+  const archives = await getMeetingArchives();
+  archives.unshift(archive);
+  if (archives.length > MAX_MEETING_ARCHIVES) {
+    archives.length = MAX_MEETING_ARCHIVES;
+  }
+  await chrome.storage.local.set({ [STORAGE_KEYS.MEETING_ARCHIVES]: archives });
+  return archives;
+}
+
+export async function deleteMeetingArchive(archiveId) {
+  const archives = (await getMeetingArchives()).filter((a) => a.id !== archiveId);
+  await chrome.storage.local.set({ [STORAGE_KEYS.MEETING_ARCHIVES]: archives });
+  return archives;
+}
+
+export async function getParticipants() {
+  const settings = await getSettings();
+  return settings.participants || DEFAULT_SETTINGS.participants;
+}
+
+export async function saveParticipants(participants, currentParticipantId) {
+  const payload = { participants };
+  if (currentParticipantId) payload.currentParticipantId = currentParticipantId;
+  return saveSettings(payload);
+}
+
 export async function clearSession() {
   await chrome.storage.local.set({ [STORAGE_KEYS.CONVERSATION]: [] });
   await chrome.storage.local.set({ [STORAGE_KEYS.IMAGE_ANALYSIS]: null });
+  await chrome.storage.local.set({ [STORAGE_KEYS.LIVE_PROFILES]: {} });
+  await chrome.storage.local.set({ [STORAGE_KEYS.SESSION]: null });
   const settings = await getSettings();
   const bidRef = (settings.referenceDocuments || []).find((d) => d.type === 'bid-document');
   if (bidRef?.content) {
@@ -85,4 +156,27 @@ export async function clearSession() {
     await saveBidDocument({ tasks: [], modifications: [], currentContent: '' });
   }
   return getBidDocument();
+}
+
+export function formatTranscriptText(conversation) {
+  return (conversation || [])
+    .map((entry) => {
+      const name = entry.participantName || (entry.speaker === 'self' ? 'You' : 'Client');
+      const time = entry.timestamp
+        ? new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        : '';
+      const display = entry.translatedText || entry.originalText;
+      const lines = [`[${time}] ${name}: ${display}`];
+      if (entry.originalText && entry.originalText !== display) {
+        lines.push(`  Original: ${entry.originalText}`);
+      }
+      if (entry.clientFacingText) {
+        lines.push(`  Say to client: ${entry.clientFacingText}`);
+      }
+      if (entry.clientFacingPronunciation) {
+        lines.push(`  Pronunciation: ${entry.clientFacingPronunciation}`);
+      }
+      return lines.join('\n');
+    })
+    .join('\n\n');
 }

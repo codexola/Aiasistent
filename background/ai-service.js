@@ -5,8 +5,14 @@ import {
   saveBidDocument,
   saveSettings,
   getImageAnalysis,
-  saveImageAnalysis
+  saveImageAnalysis,
+  getParticipants,
+  getLiveProfiles
 } from '../shared/storage.js';
+import {
+  getPastMeetingContext,
+  buildLiveProfilesContext
+} from './meeting-intelligence.js';
 
 const LANGUAGE_NAMES = {
   en: 'English',
@@ -18,9 +24,41 @@ const LANGUAGE_NAMES = {
 
 const LANGUAGE_CODES = new Set(Object.keys(LANGUAGE_NAMES));
 
+const PRONUNCIATION_RULES = `English-friendly pronunciation guide rules:
+1. Write how an English speaker should read the phrase aloud using simple English syllables.
+2. Use CAPS for stressed syllables (e.g. "see PAHR-ee byen" for Spanish).
+3. For Japanese use romaji with hyphens between words (e.g. "hajime-mashite").
+4. For Chinese use pinyin with tone numbers (e.g. "wo3 ke3 yi3 wan2 cheng2").
+5. Do NOT use IPA symbols — only readable English phonetics.
+6. Keep on one or two lines; no explanations.`;
+
+const SPOKEN_VERBAL_STYLE = `Spoken verbal delivery rules (CRITICAL):
+1. Write for SPEECH, not text — short sentences, natural rhythm, conversational flow.
+2. Use native ${'{targetLang}'} phrasing a local professional would actually say on a video call.
+3. Address the customer's specific requirement directly; do not be vague or generic.
+4. Avoid bullet points, markdown, parentheses, or written-only formalities.
+5. Sound confident, warm, and human — as if speaking face-to-face.
+6. Maximum 2–4 sentences unless a detailed answer is clearly required.
+7. Never use language that sounds like an email or document.`;
+
+function parseJsonFromAI(raw) {
+  const jsonMatch = raw.match(/\{[\s\S]*\}/);
+  return jsonMatch ? JSON.parse(jsonMatch[0]) : null;
+}
+
+function normalizePronunciation(value) {
+  if (!value || value === 'null' || value === 'none') return null;
+  return String(value).trim() || null;
+}
+
 async function buildSystemPrompt(settings, bidDoc) {
   const docs = settings.referenceDocuments || [];
   const imageAnalysis = await getImageAnalysis();
+  const participants = settings.participants || (await getParticipants());
+  const liveProfiles = await getLiveProfiles();
+  const pastContext = await getPastMeetingContext(settings);
+  const liveContext = buildLiveProfilesContext(liveProfiles, participants);
+
   const docContext = docs
     .filter((d) => !d.imageData)
     .map((d) => `--- ${d.name} (${d.type}) ---\n${d.content}`)
@@ -34,10 +72,21 @@ async function buildSystemPrompt(settings, bidDoc) {
     bidDoc.currentContent || bidDoc.sourceContent || bidDoc.modifications?.[0]?.text || '';
 
   const displayLang = LANGUAGE_NAMES[settings.displayLanguage] || 'English';
+  const clientCommName =
+    LANGUAGE_NAMES[settings.clientCommunicationLanguage || settings.clientLanguage || 'en'] ||
+    'English';
+
+  const participantList = participants
+    .map((p) => `- ${p.name} (id: ${p.id}, role: ${p.role})`)
+    .join('\n');
 
   return `You are an AI meeting assistant helping a remote worker during a live client video call for freelance/contract bidding.
 
-The worker reads ${displayLang} and has limited foreign language skills.
+The worker reads ${displayLang}, speaks English internally, and delivers verbal responses to clients in ${clientCommName}.
+Meetings may include MULTIPLE participants — track each person's intent separately.
+
+Meeting participants:
+${participantList || '- Client (client)\n- You (self)'}${liveContext}${pastContext}
 
 Reference materials:
 ${docContext || 'No documents uploaded yet.'}${imageContext}
@@ -49,22 +98,18 @@ Tracked bid state:
 ${JSON.stringify({ tasks: bidDoc.tasks, modifications: bidDoc.modifications }, null, 2)}
 
 Bidding workflow:
-1. Analyze uploaded project images (mockups, wireframes, screenshots) for scope, UI requirements, and deliverables.
-2. When the client describes new work, summarize it in taskDetails (upper modal) in ${displayLang}.
-3. When the client requests bid changes, record them in bidModifications and return the full revised text in updatedBidDocument (lower modal), in the client's language.
-4. Generate suggestedResponse in the worker's pre-selected client communication language so they can read it aloud.
+1. Analyze uploaded project images for scope, UI requirements, and deliverables.
+2. When any client-side participant describes new work, summarize in taskDetails (${displayLang}).
+3. Track bid changes in bidModifications and updatedBidDocument.
+4. Generate suggestedResponse in ${clientCommName} — spoken style, addressing the specific person's inquiry with complete accuracy.
 
 Rules:
-1. Always generate suggestedResponse in ${LANGUAGE_NAMES[settings.clientCommunicationLanguage || settings.clientLanguage || 'en'] || 'English'} (the worker's pre-selected language for speaking to the client).
-2. For non-English clients, populate taskDetails in ${displayLang} with new requirements, scope changes, deadlines, or deliverables the client mentions.
-3. For English clients, set taskDetails to null.
-4. Track bid document modifications requested by the client in bidModifications (scope, price, timeline, tech stack, etc.) in the client's language.
-5. When the client requests bid changes, also return updatedBidDocument with the full bid text after applying those changes, in the client's language.
-6. Use reference materials to answer questions accurately about skills, experience, and company.
-7. Analyze any uploaded project images for requirements, UI mockups, wireframes, or bid details and incorporate findings into taskDetails, bidModifications, and suggestedResponse.
-8. Keep suggestedResponse concise and natural for speaking aloud in a video call.
-9. Never fabricate experience not supported by reference materials.
-10. During bidding, help the worker respond professionally while aligning with the uploaded bid document.`;
+1. suggestedResponse MUST be in ${clientCommName}, native spoken style, ready to read aloud verbatim.
+2. Tailor the response to the specific participant who spoke and their stated intent/requirements.
+3. Use reference materials and past meeting insights — never fabricate unsupported claims.
+4. For non-English client communication language, populate taskDetails in ${displayLang}.
+5. Keep responses concise, natural, and verbally deliverable in a live call.
+6. Grasp each participant's intent from conversation history and live profiles.`;
 }
 
 function getImageDocuments(docs) {
@@ -119,7 +164,7 @@ async function callOpenAI(settings, messages, imageDocs = []) {
         };
       }),
       temperature: 0.7,
-      max_tokens: 1500
+      max_tokens: 2000
     })
   });
 
@@ -146,7 +191,7 @@ async function callClaude(settings, messages, imageDocs = []) {
     },
     body: JSON.stringify({
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 1500,
+      max_tokens: 2000,
       system: systemMsg?.content || '',
       messages: chatMessages.map((m, index) => ({
         role: m.role === 'assistant' ? 'assistant' : 'user',
@@ -213,6 +258,28 @@ export async function translateText(text, targetLang, settings, sourceLang) {
   return callAI(settings, messages);
 }
 
+export async function generatePronunciationGuide(text, langCode, settings) {
+  if (!text?.trim()) return null;
+  if (langCode === 'en') return null;
+
+  const langName = LANGUAGE_NAMES[langCode] || langCode;
+  const messages = [
+    {
+      role: 'system',
+      content: `You create pronunciation guides so English speakers can read ${langName} aloud correctly during video calls.
+
+${PRONUNCIATION_RULES}`
+    },
+    { role: 'user', content: text }
+  ];
+
+  try {
+    return normalizePronunciation(await callAI(settings, messages));
+  } catch {
+    return null;
+  }
+}
+
 export async function prepareMessageForClient(text, settings, sourceLang) {
   const targetLang = settings.clientCommunicationLanguage || settings.clientLanguage || 'en';
   const targetName = LANGUAGE_NAMES[targetLang] || targetLang;
@@ -224,20 +291,55 @@ export async function prepareMessageForClient(text, settings, sourceLang) {
   const messages = [
     {
       role: 'system',
-      content: `You prepare what a remote worker should say aloud to their client during a live video meeting.
+      content: `You prepare what a remote worker should SAY ALOUD to their client during a live video meeting.
 
 Target language (required): ${targetName}
 Worker may have spoken in: ${sourceName}
 
+${SPOKEN_VERBAL_STYLE.replace(/\{targetLang\}/g, targetName)}
+
 Rules:
-1. Return ONLY the message the worker should speak to the client, in ${targetName}.
-2. Preserve meaning accurately; use natural, professional tone suitable for a business call.
-3. If the input is already in ${targetName}, polish lightly for clarity and professionalism.
-4. Do not add greetings unless present in the input; do not add explanations or notes.`
+1. "message" must be native ${targetName} — spoken style, not written/formal.
+2. Directly address the customer's requirement with complete accuracy.
+3. If input is already in ${targetName}, refine into natural spoken phrasing.
+
+${PRONUNCIATION_RULES}
+
+Return JSON only:
+{
+  "message": "what the worker says to the client in ${targetName}",
+  "pronunciationGuide": "English pronunciation guide for the message (null if ${targetName} is English)"
+}`
     },
     { role: 'user', content: text }
   ];
-  return callAI(settings, messages);
+
+  const raw = await callAI(settings, messages);
+
+  try {
+    const parsed = parseJsonFromAI(raw);
+    if (parsed?.message) {
+      let pronunciation = normalizePronunciation(parsed.pronunciationGuide);
+      if (!pronunciation && targetLang !== 'en') {
+        pronunciation = await generatePronunciationGuide(parsed.message, targetLang, settings);
+      }
+      return {
+        clientFacingText: parsed.message,
+        clientFacingPronunciation: pronunciation
+      };
+    }
+  } catch {
+    /* fall through to plain-text response */
+  }
+
+  const fallbackText = raw.trim();
+  return {
+    clientFacingText: fallbackText,
+    clientFacingPronunciation:
+      targetLang !== 'en'
+        ? await generatePronunciationGuide(fallbackText, targetLang, settings)
+        : null
+  };
 }
 
 export async function analyzeProjectImages() {
@@ -298,15 +400,33 @@ export async function analyzeProjectImages() {
   }
 }
 
-export async function generateResponse(latestClientMessage) {
+export async function generateResponse(payload) {
   const settings = await getSettings();
   const conversation = await getConversation();
   const bidDoc = await getBidDocument();
   const imageDocs = getImageDocuments(settings.referenceDocuments);
+  const participants = settings.participants || (await getParticipants());
+
+  const latestClientMessage =
+    typeof payload === 'string' ? payload : payload?.message || payload?.text;
+  const speakingParticipant =
+    typeof payload === 'object' && payload?.participantName
+      ? payload
+      : conversation
+          .slice()
+          .reverse()
+          .find((e) => (e.participantRole || e.speaker) !== 'self') || null;
+
+  const speakerName =
+    speakingParticipant?.participantName || speakingParticipant?.name || 'Client';
 
   const history = conversation
-    .slice(-20)
-    .map((e) => `[${e.speaker === 'client' ? 'Client' : 'You'}]: ${e.translatedText || e.originalText}`)
+    .slice(-30)
+    .map((e) => {
+      const name = e.participantName || (e.speaker === 'self' ? 'You' : 'Client');
+      const role = e.participantRole || e.speaker || 'client';
+      return `[${name} (${role})]: ${e.translatedText || e.originalText}`;
+    })
     .join('\n');
 
   const imageNote = imageDocs.length
@@ -315,18 +435,29 @@ export async function generateResponse(latestClientMessage) {
 
   const clientCommLang = settings.clientCommunicationLanguage || settings.clientLanguage || 'en';
   const clientCommName = LANGUAGE_NAMES[clientCommLang] || clientCommLang;
+  const spokenRules = SPOKEN_VERBAL_STYLE.replace(/\{targetLang\}/g, clientCommName);
 
   const messages = [
     { role: 'system', content: await buildSystemPrompt(settings, bidDoc) },
     {
       role: 'user',
-      content: `Conversation so far:\n${history}\n\nLatest client message: "${latestClientMessage}"${imageNote}\n\nRespond in JSON only:
+      content: `Full conversation (real-time, multiple participants possible):
+${history}
+
+Latest message from ${speakerName}: "${latestClientMessage}"${imageNote}
+
+${spokenRules}
+
+Respond in JSON only:
 {
-  "clientLanguage": "detected client language code (en, ja, es, pt, zh)",
-  "suggestedResponse": "what the worker should say to the client, in ${clientCommName}",
-  "taskDetails": "new task details for upper modal section in ${LANGUAGE_NAMES[settings.displayLanguage] || 'English'} (null if client speaks English)",
-  "bidModifications": "bid document changes requested by client (client's language, or null if none)",
-  "updatedBidDocument": "full bid document text after applying client changes (client's language, or null if unchanged)",
+  "clientLanguage": "detected language code of the speaker (en, ja, es, pt, zh)",
+  "respondingTo": "${speakerName}",
+  "suggestedResponse": "native ${clientCommName} spoken response — verbal, direct, addresses their requirement with complete accuracy, ready to read aloud",
+  "pronunciationGuide": "English-friendly pronunciation for suggestedResponse (null if ${clientCommName} is English)",
+  "taskDetails": "new task details in ${LANGUAGE_NAMES[settings.displayLanguage] || 'English'} (null if not applicable)",
+  "bidModifications": "bid changes requested (null if none)",
+  "updatedBidDocument": "full revised bid text (null if unchanged)",
+  "participantIntent": "brief note on this speaker's intent and how the response addresses it",
   "reasoning": "brief internal reasoning"
 }`
     }
@@ -346,6 +477,19 @@ export async function generateResponse(latestClientMessage) {
     }
     if (parsed.clientLanguage) {
       await saveSettings({ clientLanguage: parsed.clientLanguage });
+    }
+
+    parsed.pronunciationGuide = normalizePronunciation(parsed.pronunciationGuide);
+    if (
+      parsed.suggestedResponse &&
+      !parsed.pronunciationGuide &&
+      clientCommLang !== 'en'
+    ) {
+      parsed.pronunciationGuide = await generatePronunciationGuide(
+        parsed.suggestedResponse,
+        clientCommLang,
+        settings
+      );
     }
 
     if (
@@ -373,8 +517,12 @@ export async function generateResponse(latestClientMessage) {
 
 export async function processTranscript(entry) {
   const settings = await getSettings();
-  const targetLang =
-    entry.speaker === 'client' ? settings.displayLanguage : settings.selfOutputLanguage;
+  const participantRole =
+    entry.participantRole || (entry.speaker === 'self' ? 'self' : 'client');
+  const isSelf = participantRole === 'self';
+  const legacySpeaker = isSelf ? 'self' : 'client';
+
+  const targetLang = isSelf ? settings.selfOutputLanguage : settings.displayLanguage;
 
   let detectedLanguage = entry.detectedLanguage;
   let translatedText = entry.originalText;
@@ -387,14 +535,15 @@ export async function processTranscript(entry) {
       translatedText,
       displayLanguage: targetLang,
       translationError: 'API key not configured',
-      ...(entry.speaker === 'self'
+      ...(isSelf
         ? { clientFacingError: 'API key not configured — set key in extension popup' }
         : {})
     };
   }
 
-  const configuredInputLang =
-    entry.speaker === 'client' ? settings.clientInputLanguage : settings.selfInputLanguage;
+  const configuredInputLang = isSelf
+    ? settings.selfInputLanguage
+    : settings.clientInputLanguage;
 
   if (!detectedLanguage || detectedLanguage === 'auto') {
     if (configuredInputLang && configuredInputLang !== 'auto') {
@@ -408,7 +557,7 @@ export async function processTranscript(entry) {
       }
     }
     if (
-      entry.speaker === 'client' &&
+      !isSelf &&
       detectedLanguage !== 'unknown' &&
       detectedLanguage !== settings.clientLanguage
     ) {
@@ -431,16 +580,19 @@ export async function processTranscript(entry) {
   }
 
   let clientFacingText = null;
+  let clientFacingPronunciation = null;
   let clientFacingError = null;
   const clientCommLang = settings.clientCommunicationLanguage || settings.clientLanguage || 'en';
 
-  if (entry.speaker === 'self') {
+  if (isSelf) {
     try {
-      clientFacingText = await prepareMessageForClient(
+      const prepared = await prepareMessageForClient(
         entry.originalText,
         settings,
         detectedLanguage
       );
+      clientFacingText = prepared.clientFacingText;
+      clientFacingPronunciation = prepared.clientFacingPronunciation;
     } catch (err) {
       console.error('Client message preparation failed:', err);
       clientFacingError = err.message;
@@ -452,6 +604,11 @@ export async function processTranscript(entry) {
             settings,
             detectedLanguage
           );
+          clientFacingPronunciation = await generatePronunciationGuide(
+            clientFacingText,
+            clientCommLang,
+            settings
+          );
           clientFacingError = null;
         } catch (fallbackErr) {
           clientFacingError = fallbackErr.message;
@@ -462,11 +619,14 @@ export async function processTranscript(entry) {
 
   return {
     ...entry,
+    speaker: legacySpeaker,
+    participantRole,
     detectedLanguage,
     translatedText,
     displayLanguage: targetLang,
     clientCommunicationLanguage: clientCommLang,
     ...(clientFacingText ? { clientFacingText } : {}),
+    ...(clientFacingPronunciation ? { clientFacingPronunciation } : {}),
     ...(clientFacingError ? { clientFacingError } : {}),
     ...(translationError ? { translationError } : {})
   };

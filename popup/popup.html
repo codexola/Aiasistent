@@ -15,6 +15,7 @@
 
     <nav class="tabs">
       <button class="tab active" data-tab="documents">Documents</button>
+      <button class="tab" data-tab="archives">Archives</button>
       <button class="tab" data-tab="settings">API Settings</button>
     </nav>
 
@@ -84,6 +85,13 @@
 
       <div class="doc-list" id="doc-list">
         <p class="empty">No documents uploaded yet.</p>
+      </div>
+    </section>
+
+    <section id="tab-archives" class="tab-panel">
+      <p class="hint">Past meetings analyzed by AI — used as reference for future calls.</p>
+      <div class="archive-list" id="archive-list">
+        <p class="empty">No archived meetings yet. Click "End & Archive" in the meeting sidebar when done.</p>
       </div>
     </section>
 
@@ -163,6 +171,13 @@
           <option value="pt">Portuguese</option>
           <option value="zh">Chinese</option>
         </select>
+      </div>
+
+      <div class="form-group">
+        <label class="ai-toggle-inline">
+          <input type="checkbox" id="popup-use-past-insights" checked />
+          Use past meeting insights in AI responses
+        </label>
       </div>
 
       <button id="save-settings" class="btn-primary">Save Settings</button>

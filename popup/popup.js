@@ -12,6 +12,7 @@ document.querySelectorAll('.tab').forEach((tab) => {
     document.querySelectorAll('.tab-panel').forEach((p) => p.classList.remove('active'));
     tab.classList.add('active');
     document.getElementById(`tab-${tab.dataset.tab}`).classList.add('active');
+    if (tab.dataset.tab === 'archives') loadArchives();
   });
 });
 
@@ -54,6 +55,7 @@ async function loadSettings() {
     settings.clientCommunicationLanguage || settings.clientLanguage || 'en';
   document.getElementById('popup-client-input-lang').value = settings.clientInputLanguage || 'auto';
   document.getElementById('popup-self-input-lang').value = settings.selfInputLanguage || 'auto';
+  document.getElementById('popup-use-past-insights').checked = settings.usePastMeetingInsights !== false;
 
   const isClaude = settings.apiProvider === 'claude';
   document.getElementById('openai-key-group').style.display = isClaude ? 'none' : 'block';
@@ -62,6 +64,43 @@ async function loadSettings() {
   renderDocList(settings.referenceDocuments || []);
   updateReadiness();
   loadImageAnalysis(settings.referenceDocuments || []);
+  loadArchives();
+}
+
+async function loadArchives() {
+  const list = document.getElementById('archive-list');
+  if (!list) return;
+
+  try {
+    const archives = await sendMessage(MESSAGE_TYPES.GET_MEETING_ARCHIVES);
+    if (!archives?.length) {
+      list.innerHTML = '<p class="empty">No archived meetings yet. Click "End & Archive" in the meeting sidebar when done.</p>';
+      return;
+    }
+
+    list.innerHTML = archives
+      .map(
+        (a) => `
+      <div class="archive-item">
+        <div class="archive-title">${escapeHtml(a.title || 'Meeting')}</div>
+        <div class="archive-meta">${new Date(a.endedAt || a.startedAt).toLocaleString()} · ${(a.participants || []).length} participants</div>
+        <p class="archive-summary">${escapeHtml((a.analysis?.summary || '').slice(0, 200))}${(a.analysis?.summary || '').length > 200 ? '…' : ''}</p>
+        ${a.videoFileName ? `<div class="archive-video">Video: ${escapeHtml(a.videoFileName)}</div>` : ''}
+        <button type="button" class="archive-delete" data-id="${escapeHtml(a.id)}">Delete</button>
+      </div>`
+      )
+      .join('');
+
+    list.querySelectorAll('.archive-delete').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        if (!confirm('Delete this meeting archive?')) return;
+        await sendMessage(MESSAGE_TYPES.DELETE_MEETING_ARCHIVE, btn.dataset.id);
+        loadArchives();
+      });
+    });
+  } catch {
+    list.innerHTML = '<p class="empty">Could not load archives.</p>';
+  }
 }
 
 async function loadImageAnalysis(docs) {
@@ -129,7 +168,8 @@ document.getElementById('save-settings').addEventListener('click', async () => {
     selfOutputLanguage: document.getElementById('popup-self-lang').value,
     clientCommunicationLanguage: document.getElementById('popup-client-comm-lang').value,
     clientInputLanguage: document.getElementById('popup-client-input-lang').value,
-    selfInputLanguage: document.getElementById('popup-self-input-lang').value
+    selfInputLanguage: document.getElementById('popup-self-input-lang').value,
+    usePastMeetingInsights: document.getElementById('popup-use-past-insights').checked
   };
 
   await sendMessage(MESSAGE_TYPES.SETTINGS_UPDATED, settings);
@@ -296,7 +336,8 @@ document.getElementById('export-session').addEventListener('click', async () => 
   }
 
   const lines = history.map((entry) => {
-    const speaker = entry.speaker === 'client' ? 'Client' : 'You';
+    const speaker = entry.participantName ||
+      (entry.speaker === 'client' ? 'Client' : 'You');
     const time = entry.timestamp
       ? new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
       : '';
@@ -307,6 +348,9 @@ document.getElementById('export-session').addEventListener('click', async () => 
     }
     if (entry.clientFacingText) {
       parts.push(`  Say to client: ${entry.clientFacingText}`);
+    }
+    if (entry.clientFacingPronunciation) {
+      parts.push(`  Pronunciation: ${entry.clientFacingPronunciation}`);
     }
     return parts.join('\n');
   });

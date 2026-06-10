@@ -25,9 +25,14 @@
   const SIDEBAR_WIDTH = 380;
 
   let settings = {};
-  let currentSpeaker = 'client';
+  let participants = [];
+  let currentParticipantId = 'client-1';
   let recognition = null;
-  let isRecording = false;
+  let isListening = false;
+  let mediaRecorder = null;
+  let videoChunks = [];
+  let videoRecordingStart = null;
+  let captureStream = null;
   let conversation = [];
   let bidDocument = { tasks: [], modifications: [] };
   let responseDebounceTimer = null;
@@ -95,6 +100,30 @@
           </div>
 
           <div class="ai-section">
+            <div class="ai-section-title">Meeting Session</div>
+            <div class="ai-session-row">
+              <button class="ai-session-btn" id="ai-start-video" type="button">⏺ Record Video</button>
+              <button class="ai-session-btn danger" id="ai-end-meeting" type="button">⏹ End & Archive</button>
+            </div>
+            <p class="ai-hint" id="ai-recording-status">Captures full conversation in real time. Video archives to your Downloads folder.</p>
+          </div>
+
+          <div class="ai-section">
+            <div class="ai-section-title">Participants</div>
+            <div class="ai-participant-list" id="ai-participant-list"></div>
+            <div class="ai-participant-add">
+              <input type="text" id="ai-new-participant-name" placeholder="Name (e.g. Client 2)" />
+              <select id="ai-new-participant-role">
+                <option value="client">Client</option>
+                <option value="colleague">Colleague</option>
+                <option value="self">You</option>
+              </select>
+              <button type="button" id="ai-add-participant" class="ai-add-btn">+</button>
+            </div>
+            <p class="ai-hint">Select who is speaking. Alt+1–9 for quick switch.</p>
+          </div>
+
+          <div class="ai-section">
             <div class="ai-section-title">Controls</div>
             <div class="ai-toggle-row">
               <span>AI Response Modal</span>
@@ -110,11 +139,6 @@
                 <span class="ai-switch-slider"></span>
               </label>
             </div>
-            <div class="ai-speaker-toggle">
-              <button class="ai-speaker-btn active" data-speaker="client" id="ai-btn-client" title="Alt+1">👤 Client</button>
-              <button class="ai-speaker-btn" data-speaker="self" id="ai-btn-self" title="Alt+2">🎤 You</button>
-            </div>
-            <p class="ai-hint">Tag who is speaking. Use Alt+1 (Client) or Alt+2 (You).</p>
           </div>
 
           <div class="ai-section" style="padding-bottom:4px;">
@@ -159,8 +183,13 @@
     document.body.appendChild(root);
     applyPageLayout(false);
     bindEvents();
-    loadSettings();
+    bootstrapSidebar();
+  }
+
+  async function bootstrapSidebar() {
+    await loadSettings();
     checkApiStatus();
+    await initMeetingSession();
     loadConversationHistory();
     loadBidDocument();
     ensureImageAnalysis();
@@ -217,12 +246,14 @@
 
     document.getElementById('ai-client-input-lang').addEventListener('change', (e) => {
       saveSetting('clientInputLanguage', e.target.value);
-      if (currentSpeaker === 'client') updateRecognitionLanguage();
+      if (!getActiveParticipant()?.role || getActiveParticipant()?.role !== 'self') {
+        updateRecognitionLanguage();
+      }
     });
 
     document.getElementById('ai-self-input-lang').addEventListener('change', (e) => {
       saveSetting('selfInputLanguage', e.target.value);
-      if (currentSpeaker === 'self') updateRecognitionLanguage();
+      if (getActiveParticipant()?.role === 'self') updateRecognitionLanguage();
     });
 
     document.getElementById('ai-responses-toggle').addEventListener('change', (e) => {
@@ -234,8 +265,9 @@
       saveSetting('autoTranslate', e.target.checked);
     });
 
-    document.getElementById('ai-btn-client').addEventListener('click', () => setSpeaker('client'));
-    document.getElementById('ai-btn-self').addEventListener('click', () => setSpeaker('self'));
+    document.getElementById('ai-add-participant').addEventListener('click', addParticipant);
+    document.getElementById('ai-start-video').addEventListener('click', toggleVideoRecording);
+    document.getElementById('ai-end-meeting').addEventListener('click', endMeetingAndArchive);
 
     document.getElementById('ai-generate-btn').addEventListener('click', () => generateAIResponse());
     document.getElementById('ai-export-btn').addEventListener('click', exportTranscript);
@@ -247,9 +279,96 @@
 
     document.addEventListener('keydown', (e) => {
       if (!e.altKey || e.target.matches('input, textarea, select')) return;
-      if (e.key === '1') setSpeaker('client');
-      if (e.key === '2') setSpeaker('self');
+      const idx = parseInt(e.key, 10);
+      if (idx >= 1 && idx <= 9 && participants[idx - 1]) {
+        setActiveParticipant(participants[idx - 1].id);
+      }
     });
+  }
+
+  function getActiveParticipant() {
+    return participants.find((p) => p.id === currentParticipantId) ||
+      participants.find((p) => p.role === 'client') ||
+      participants[0];
+  }
+
+  async function initMeetingSession() {
+    try {
+      participants = await sendMessage('GET_PARTICIPANTS');
+      currentParticipantId = settings.currentParticipantId || participants[0]?.id || 'client-1';
+      renderParticipantList();
+      await sendMessage('START_SESSION', participants);
+    } catch (err) {
+      console.error('Session init failed:', err);
+    }
+  }
+
+  function renderParticipantList() {
+    const list = document.getElementById('ai-participant-list');
+    if (!list) return;
+    list.innerHTML = participants
+      .map(
+        (p) => `
+      <button type="button" class="ai-participant-btn ${p.id === currentParticipantId ? 'active' : ''}"
+        data-id="${escapeAttr(p.id)}" title="Alt+${participants.indexOf(p) + 1}">
+        ${p.role === 'self' ? '🎤' : p.role === 'colleague' ? '👥' : '👤'}
+        ${escapeHtml(p.name)}
+        ${p.role !== 'self' ? `<span class="ai-part-remove" data-remove="${escapeAttr(p.id)}" title="Remove">×</span>` : ''}
+      </button>`
+      )
+      .join('');
+
+    list.querySelectorAll('.ai-participant-btn').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        if (e.target.classList.contains('ai-part-remove')) return;
+        setActiveParticipant(btn.dataset.id);
+      });
+    });
+    list.querySelectorAll('.ai-part-remove').forEach((btn) => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        await removeParticipant(btn.dataset.remove);
+      });
+    });
+  }
+
+  async function addParticipant() {
+    const nameInput = document.getElementById('ai-new-participant-name');
+    const roleSelect = document.getElementById('ai-new-participant-role');
+    const name = nameInput.value.trim();
+    if (!name) return;
+
+    const role = roleSelect.value;
+    const id = `${role}-${Date.now()}`;
+    if (role === 'self' && participants.some((p) => p.role === 'self')) {
+      alert('Only one "You" participant is allowed.');
+      return;
+    }
+
+    participants.push({ id, name, role });
+    await sendMessage('SAVE_PARTICIPANTS', { participants, currentParticipantId });
+    nameInput.value = '';
+    renderParticipantList();
+  }
+
+  async function removeParticipant(id) {
+    const p = participants.find((x) => x.id === id);
+    if (!p || p.role === 'self') return;
+    participants = participants.filter((x) => x.id !== id);
+    if (currentParticipantId === id) {
+      currentParticipantId = participants.find((x) => x.role === 'client')?.id || participants[0]?.id;
+    }
+    await sendMessage('SAVE_PARTICIPANTS', { participants, currentParticipantId });
+    renderParticipantList();
+  }
+
+  async function setActiveParticipant(id) {
+    currentParticipantId = id;
+    await sendMessage('SET_ACTIVE_PARTICIPANT', id);
+    renderParticipantList();
+    updateRecognitionLanguage();
+    const p = getActiveParticipant();
+    setStatus(p ? `Listening (${p.name})...` : 'Listening...', true);
   }
 
   async function loadSettings() {
@@ -266,6 +385,9 @@
       updateClientCommBadge(settings.clientCommunicationLanguage || settings.clientLanguage || 'en');
       updateClientLanguageBadge(settings.clientLanguage || 'en');
       updateModalSections(settings.clientLanguage || 'en');
+      participants = settings.participants || participants;
+      currentParticipantId = settings.currentParticipantId || currentParticipantId;
+      renderParticipantList();
       if (settings.responsesEnabled) toggleModal(true);
     } catch (err) {
       console.error('Failed to load settings:', err);
@@ -303,12 +425,136 @@
     if (key === 'clientCommunicationLanguage') updateClientCommBadge(value);
   }
 
-  function setSpeaker(speaker) {
-    currentSpeaker = speaker;
-    document.getElementById('ai-btn-client').classList.toggle('active', speaker === 'client');
-    document.getElementById('ai-btn-self').classList.toggle('active', speaker === 'self');
-    updateRecognitionLanguage();
-    setStatus(speaker === 'client' ? 'Listening (Client)...' : 'Listening (You)...', true);
+  function getLegacySpeaker(role) {
+    return role === 'self' ? 'self' : 'client';
+  }
+
+  async function toggleVideoRecording() {
+    const btn = document.getElementById('ai-start-video');
+    const status = document.getElementById('ai-recording-status');
+
+    if (mediaRecorder?.state === 'recording') {
+      stopVideoRecording();
+      btn.textContent = '⏺ Record Video';
+      btn.classList.remove('recording');
+      return;
+    }
+
+    try {
+      const { streamId } = await sendMessage('GET_TAB_CAPTURE_STREAM_ID');
+      captureStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          mandatory: {
+            chromeMediaSource: 'tab',
+            chromeMediaSourceId: streamId
+          }
+        },
+        video: {
+          mandatory: {
+            chromeMediaSource: 'tab',
+            chromeMediaSourceId: streamId
+          }
+        }
+      });
+
+      videoChunks = [];
+      const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
+        ? 'video/webm;codecs=vp9,opus'
+        : 'video/webm';
+      mediaRecorder = new MediaRecorder(captureStream, { mimeType });
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) videoChunks.push(e.data);
+      };
+      mediaRecorder.start(1000);
+      videoRecordingStart = Date.now();
+      btn.textContent = '⏹ Stop Video';
+      btn.classList.add('recording');
+      status.textContent = 'Recording meeting video + audio...';
+    } catch (err) {
+      status.textContent = `Video recording failed: ${err.message}`;
+    }
+  }
+
+  function stopVideoRecording() {
+    return new Promise((resolve) => {
+      if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+        resolve(null);
+        return;
+      }
+      mediaRecorder.onstop = () => {
+        captureStream?.getTracks().forEach((t) => t.stop());
+        captureStream = null;
+        resolve({
+          blob: new Blob(videoChunks, { type: 'video/webm' }),
+          durationMs: videoRecordingStart ? Date.now() - videoRecordingStart : 0
+        });
+      };
+      mediaRecorder.stop();
+    });
+  }
+
+  async function downloadVideoBlob(blob) {
+    if (!blob?.size) return null;
+    const fileName = `meeting-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.webm`;
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = fileName;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    return fileName;
+  }
+
+  async function endMeetingAndArchive() {
+    const btn = document.getElementById('ai-end-meeting');
+    const status = document.getElementById('ai-recording-status');
+    btn.disabled = true;
+    status.textContent = 'Archiving meeting — analyzing with AI...';
+
+    try {
+      let videoMeta = null;
+      if (mediaRecorder?.state === 'recording') {
+        videoMeta = await stopVideoRecording();
+        document.getElementById('ai-start-video').textContent = '⏺ Record Video';
+        document.getElementById('ai-start-video').classList.remove('recording');
+      }
+
+      let videoFileName = null;
+      if (videoMeta?.blob) {
+        videoFileName = await downloadVideoBlob(videoMeta.blob);
+      }
+
+      const archive = await sendMessage('END_MEETING_ARCHIVE', {
+        conversation,
+        participants,
+        videoFileName,
+        videoDurationMs: videoMeta?.durationMs || null
+      });
+
+      const textBlob = new Blob(
+        [archive.transcriptText || '', '\n\n--- AI Analysis ---\n', archive.analysis?.summary || ''],
+        { type: 'text/plain;charset=utf-8' }
+      );
+      const textUrl = URL.createObjectURL(textBlob);
+      const textAnchor = document.createElement('a');
+      textAnchor.href = textUrl;
+      textAnchor.download = `meeting-transcript-${archive.id.slice(0, 8)}.txt`;
+      textAnchor.click();
+      URL.revokeObjectURL(textUrl);
+
+      status.textContent = `Archived: ${archive.title}. Insights saved for future meetings.`;
+      alert(
+        `Meeting archived successfully.\n\n` +
+        `Text transcript downloaded.\n` +
+        (videoFileName ? `Video saved: ${videoFileName}\n` : '') +
+        `AI analysis stored — will be used as reference in future meetings.`
+      );
+    } catch (err) {
+      status.textContent = `Archive failed: ${err.message}`;
+      alert(err.message || 'Failed to archive meeting');
+    }
+
+    btn.disabled = false;
   }
 
   function updateModalLayout() {
@@ -418,10 +664,11 @@
   }
 
   function getInputLanguageCode() {
-    if (currentSpeaker === 'client') {
-      return settings.clientInputLanguage || 'auto';
+    const p = getActiveParticipant();
+    if (p?.role === 'self') {
+      return settings.selfInputLanguage || 'auto';
     }
-    return settings.selfInputLanguage || 'auto';
+    return settings.clientInputLanguage || 'auto';
   }
 
   function updateRecognitionLanguage() {
@@ -431,7 +678,7 @@
   }
 
   function restartRecognition() {
-    if (!recognition || !isRecording) return;
+    if (!recognition || !isListening) return;
     try {
       recognition.stop();
     } catch {
@@ -478,12 +725,12 @@
     };
 
     recognition.onend = () => {
-      if (isRecording) recognition.start();
+      if (isListening) recognition.start();
     };
 
     try {
       recognition.start();
-      isRecording = true;
+      isListening = true;
       setStatus('Listening...', true);
       document.getElementById('ai-status-dot').classList.add('recording');
     } catch {
@@ -494,8 +741,13 @@
   async function handleTranscript(text) {
     if (!text) return;
 
+    const active = getActiveParticipant();
+    const participantRole = active?.role || 'client';
     const entry = {
-      speaker: currentSpeaker,
+      speaker: getLegacySpeaker(participantRole),
+      participantId: active?.id || currentParticipantId,
+      participantName: active?.name || 'Unknown',
+      participantRole,
       originalText: text,
       detectedLanguage: 'auto'
     };
@@ -508,7 +760,7 @@
         setStatus('Listening...', true);
 
         if (
-          result.entry.speaker === 'client' &&
+          result.entry.participantRole !== 'self' &&
           result.entry.detectedLanguage &&
           result.entry.detectedLanguage !== 'unknown'
         ) {
@@ -520,14 +772,14 @@
           }
           if (
             (settings.clientInputLanguage || 'auto') === 'auto' &&
-            currentSpeaker === 'client'
+            participantRole !== 'self'
           ) {
             recognition.lang = SPEECH_LANG_MAP[lang] || 'en-US';
           }
         }
 
-        if (currentSpeaker === 'client' && settings.responsesEnabled) {
-          scheduleAIResponse(text);
+        if (participantRole !== 'self' && settings.responsesEnabled) {
+          scheduleAIResponse(text, result.entry);
         }
       }
     } catch (err) {
@@ -543,9 +795,12 @@
     }
   }
 
-  function scheduleAIResponse(clientMessage) {
+  function scheduleAIResponse(clientMessage, entry) {
     clearTimeout(responseDebounceTimer);
-    responseDebounceTimer = setTimeout(() => generateAIResponse(clientMessage), 1200);
+    responseDebounceTimer = setTimeout(
+      () => generateAIResponse(clientMessage, entry),
+      1200
+    );
   }
 
   function formatTime(ts) {
@@ -556,10 +811,11 @@
   function renderTranscriptEntry(entry) {
     const container = document.getElementById('ai-transcript');
     const div = document.createElement('div');
-    div.className = `ai-transcript-entry ${entry.speaker}`;
+    div.className = `ai-transcript-entry ${entry.participantRole || entry.speaker || 'client'}`;
     div.dataset.entryId = entry.id || '';
 
-    const speakerLabel = entry.speaker === 'client' ? 'Client' : 'You';
+    const speakerLabel = entry.participantName ||
+      (entry.speaker === 'self' ? 'You' : 'Client');
     const displayText = entry.translatedText || entry.originalText;
     const showOriginal =
       entry.translatedText && entry.translatedText !== entry.originalText;
@@ -569,18 +825,8 @@
       settings.clientLanguage ||
       'en';
     const clientCommLabel = LANG_LABELS[clientCommLang] || clientCommLang;
-    const clientFacing = entry.speaker === 'self'
-      ? entry.clientFacingText
-        ? `<div class="client-facing">
-            <div class="client-facing-header">
-              <span>Say to client (${clientCommLabel})</span>
-              <button type="button" class="client-facing-copy" data-text="${escapeAttr(entry.clientFacingText)}" title="Copy">📋</button>
-            </div>
-            ${escapeHtml(entry.clientFacingText)}
-          </div>`
-        : entry.clientFacingError
-          ? `<div class="client-facing error-note">Client message: ${escapeHtml(entry.clientFacingError)}</div>`
-          : ''
+    const clientFacing = (entry.participantRole === 'self' || entry.speaker === 'self')
+      ? formatClientFacingBlock(entry, clientCommLabel)
       : '';
     const errorNote = entry.translationError
       ? `<div class="error-note">${escapeHtml(entry.translationError)}</div>`
@@ -614,6 +860,31 @@
       .replace(/</g, '&lt;');
   }
 
+  function formatPronunciationHtml(pronunciation) {
+    if (!pronunciation) return '';
+    return `<div class="pronunciation-guide">
+      <span class="pronunciation-label">Pronunciation (English)</span>
+      ${escapeHtml(pronunciation)}
+    </div>`;
+  }
+
+  function formatClientFacingBlock(entry, clientCommLabel) {
+    if (!entry.clientFacingText) {
+      return entry.clientFacingError
+        ? `<div class="client-facing error-note">Client message: ${escapeHtml(entry.clientFacingError)}</div>`
+        : '';
+    }
+
+    return `<div class="client-facing">
+      <div class="client-facing-header">
+        <span>Say to client (${clientCommLabel})</span>
+        <button type="button" class="client-facing-copy" data-text="${escapeAttr(entry.clientFacingText)}" title="Copy">📋</button>
+      </div>
+      ${escapeHtml(entry.clientFacingText)}
+      ${formatPronunciationHtml(entry.clientFacingPronunciation)}
+    </div>`;
+  }
+
   function syncSettingsUI() {
     const displayLang = document.getElementById('ai-display-lang');
     const selfLang = document.getElementById('ai-self-lang');
@@ -640,12 +911,13 @@
     history.forEach((entry) => renderTranscriptEntry(entry));
   }
 
-  async function generateAIResponse(clientMessage) {
+  async function generateAIResponse(clientMessage, sourceEntry) {
     const btn = document.getElementById('ai-generate-btn');
     btn.disabled = true;
 
-    const latestClient = clientMessage ||
-      [...conversation].reverse().find((e) => e.speaker === 'client')?.originalText;
+    const latestEntry = sourceEntry ||
+      [...conversation].reverse().find((e) => (e.participantRole || e.speaker) !== 'self');
+    const latestClient = clientMessage || latestEntry?.originalText;
 
     if (!latestClient) {
       btn.disabled = false;
@@ -655,10 +927,15 @@
     if (settings.responsesEnabled) toggleModal(true);
 
     const responseEl = document.getElementById('ai-modal-response');
-    responseEl.innerHTML = '<div class="ai-modal-loading"><div class="ai-spinner"></div> Generating response...</div>';
+    responseEl.innerHTML = '<div class="ai-modal-loading"><div class="ai-spinner"></div> Generating spoken response...</div>';
 
     try {
-      const result = await sendMessage('GENERATE_RESPONSE', latestClient);
+      const result = await sendMessage('GENERATE_RESPONSE', {
+        message: latestClient,
+        participantId: latestEntry?.participantId,
+        participantName: latestEntry?.participantName,
+        participantRole: latestEntry?.participantRole
+      });
 
       if (result.clientLanguage) {
         settings.clientLanguage = result.clientLanguage;
@@ -672,11 +949,15 @@
 
       updateModalFromResponse(result);
       lastSuggestedResponse = result.suggestedResponse || 'No response generated.';
+      const intentNote = result.participantIntent
+        ? `<div class="response-intent">Intent: ${escapeHtml(result.participantIntent)}</div>`
+        : '';
       const translationNote =
         result.responseTranslation && result.responseTranslation !== lastSuggestedResponse
           ? `<div class="response-translation">Meaning (${LANG_LABELS[settings.displayLanguage] || 'your language'}): ${escapeHtml(result.responseTranslation)}</div>`
           : '';
-      responseEl.innerHTML = `${escapeHtml(lastSuggestedResponse)}${translationNote}`;
+      const pronunciationNote = formatPronunciationHtml(result.pronunciationGuide);
+      responseEl.innerHTML = `${escapeHtml(lastSuggestedResponse)}${pronunciationNote}${intentNote}${translationNote}`;
     } catch (err) {
       lastSuggestedResponse = '';
       responseEl.textContent = `Error: ${err.message || 'Failed to generate response'}`;
@@ -692,7 +973,8 @@
     }
 
     const lines = conversation.map((entry) => {
-      const speaker = entry.speaker === 'client' ? 'Client' : 'You';
+      const speaker = entry.participantName ||
+        (entry.speaker === 'client' ? 'Client' : 'You');
       const time = formatTime(entry.timestamp);
       const display = entry.translatedText || entry.originalText;
       const parts = [`[${time}] ${speaker}: ${display}`];
@@ -701,6 +983,9 @@
       }
       if (entry.clientFacingText) {
         parts.push(`  Say to client: ${entry.clientFacingText}`);
+      }
+      if (entry.clientFacingPronunciation) {
+        parts.push(`  Pronunciation: ${entry.clientFacingPronunciation}`);
       }
       return parts.join('\n');
     });
