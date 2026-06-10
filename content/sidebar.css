@@ -4,12 +4,58 @@ body.ai-meeting-assistant-active {
 }
 
 body.ai-meeting-assistant-active.ai-sidebar-collapsed {
-  margin-right: 40px !important;
+  margin-right: 0 !important;
 }
 
 #ai-meeting-assistant-root {
   all: initial;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+.ai-expand-tab {
+  position: fixed;
+  top: 50%;
+  right: 0;
+  transform: translateY(-50%);
+  z-index: 2147483647;
+  width: 32px;
+  min-height: 72px;
+  padding: 10px 6px;
+  background: #1a1d2e;
+  border: 1px solid #2d3148;
+  border-right: none;
+  border-radius: 8px 0 0 8px;
+  color: #a5b4fc;
+  cursor: pointer;
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  font-size: 16px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  box-shadow: -2px 0 12px rgba(0, 0, 0, 0.35);
+}
+
+.ai-expand-tab.visible {
+  display: flex;
+}
+
+.ai-expand-tab:hover {
+  background: #2d2f6b;
+  color: #fff;
+}
+
+.ai-expand-tab-label {
+  writing-mode: vertical-rl;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: #9ca3af;
+}
+
+.ai-expand-tab:hover .ai-expand-tab-label {
+  color: #e8eaed;
 }
 
 #ai-meeting-sidebar.collapsed .ai-stealth-hide {
@@ -33,7 +79,8 @@ body.ai-meeting-assistant-active.ai-sidebar-collapsed {
 }
 
 #ai-meeting-sidebar.collapsed {
-  transform: translateX(340px);
+  transform: translateX(100%);
+  pointer-events: none;
 }
 
 .ai-sidebar-header {

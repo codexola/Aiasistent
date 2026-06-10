@@ -56,6 +56,10 @@
     root.id = 'ai-meeting-assistant-root';
 
     root.innerHTML = `
+      <button type="button" id="ai-expand-tab" class="ai-expand-tab" title="Expand Assist">
+        ◀
+        <span class="ai-expand-tab-label">Assist</span>
+      </button>
       <div id="ai-meeting-sidebar">
         <div class="ai-sidebar-header">
           <div style="display:flex;align-items:center;">
@@ -242,11 +246,7 @@
 
   function applyStealthLayout() {
     if (settings.stealthMode === false) return;
-    const sidebar = document.getElementById('ai-meeting-sidebar');
-    if (!sidebar) return;
-    sidebar.classList.add('collapsed');
-    applyPageLayout(true);
-    document.getElementById('ai-collapse-btn').textContent = '▶';
+    setSidebarCollapsed(true);
     toggleModal(false);
   }
 
@@ -307,19 +307,34 @@
   }
 
   function applyPageLayout(collapsed) {
-    const width = collapsed ? 40 : SIDEBAR_WIDTH;
+    const width = collapsed ? 0 : SIDEBAR_WIDTH;
     document.documentElement.style.setProperty('--ai-sidebar-width', `${width}px`);
     document.body.classList.add('ai-meeting-assistant-active');
     document.body.classList.toggle('ai-sidebar-collapsed', collapsed);
   }
 
+  function setSidebarCollapsed(collapsed) {
+    const sidebar = document.getElementById('ai-meeting-sidebar');
+    const expandTab = document.getElementById('ai-expand-tab');
+    if (!sidebar) return;
+
+    sidebar.classList.toggle('collapsed', collapsed);
+    if (expandTab) expandTab.classList.toggle('visible', collapsed);
+    applyPageLayout(collapsed);
+    updateModalLayout();
+
+    const collapseBtn = document.getElementById('ai-collapse-btn');
+    if (collapseBtn) collapseBtn.textContent = collapsed ? '▶' : '◀';
+  }
+
   function bindEvents() {
+    document.getElementById('ai-expand-tab').addEventListener('click', () => {
+      setSidebarCollapsed(false);
+    });
+
     document.getElementById('ai-collapse-btn').addEventListener('click', () => {
       const sidebar = document.getElementById('ai-meeting-sidebar');
-      const collapsed = sidebar.classList.toggle('collapsed');
-      applyPageLayout(collapsed);
-      document.getElementById('ai-collapse-btn').textContent = collapsed ? '▶' : '◀';
-      updateModalLayout();
+      setSidebarCollapsed(!sidebar.classList.contains('collapsed'));
     });
 
     document.getElementById('ai-display-lang').addEventListener('change', (e) => {
@@ -662,7 +677,7 @@
     const modal = document.getElementById('ai-meeting-modal');
     const backdrop = document.getElementById('ai-meeting-modal-backdrop');
     if (!sidebar || !modal) return;
-    const sidebarWidth = sidebar.classList.contains('collapsed') ? 40 : SIDEBAR_WIDTH;
+    const sidebarWidth = sidebar.classList.contains('collapsed') ? 0 : SIDEBAR_WIDTH;
     modal.style.right = `${sidebarWidth + 16}px`;
     if (backdrop) backdrop.style.right = `${sidebarWidth}px`;
   }
